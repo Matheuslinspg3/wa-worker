@@ -1,0 +1,21 @@
+{
+  "name": "wa-worker",
+  "version": "1.0.0",
+  "description": "Worker básico de WhatsApp com Baileys e Supabase para deploy no Easypanel.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "supabase",
+    "easypanel",
+    "worker"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "@whiskeysockets/baileys": "^6.7.18"
+  }
+}
