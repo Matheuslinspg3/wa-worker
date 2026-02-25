@@ -229,14 +229,32 @@ async function connectToWhatsApp() {
     const { connection, lastDisconnect } = update
 
     if (update.qr) {
-      const qrCodeBase64 = await QRCode.toDataURL(update.qr).catch((error) => {
-        console.error(`Failed to generate QR base64: ${error.message}`)
-        return null
-      })
+      try {
+        console.log(`QR received (len): ${update.qr.length}`)
+        const dataUrl = await QRCode.toDataURL(update.qr)
+        console.log(`QR dataUrl generated (len): ${dataUrl.length}`)
 
-      if (qrCodeBase64) {
-        await updateStatus('CONNECTING', qrCodeBase64).catch(() => {})
-        console.log('QR generated')
+        const response = await fetch(`${process.env.EDGE_BASE_URL}/update-status`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.WORKER_SECRET}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            instanceId: process.env.INSTANCE_ID,
+            status: 'CONNECTING',
+            qr_code: dataUrl,
+          }),
+        })
+
+        if (!response.ok) {
+          const responseBody = await response.text().catch(() => '')
+          console.error(`update-status failed: ${response.status} ${responseBody}`)
+        } else {
+          console.log('QR saved')
+        }
+      } catch (error) {
+        console.error(`QR handler error: ${error.message}`)
       }
     }
 
