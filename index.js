@@ -174,7 +174,7 @@ async function connectToWhatsApp() {
   sock = makeWASocket({
     auth: state,
     version,
-    printQRInTerminal: false,
+    printQRInTerminal: true,
   })
 
   sock.ev.on('creds.update', saveCreds)
