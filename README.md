@@ -42,6 +42,10 @@ Com base no `EDGE_BASE_URL`:
    - `INSTANCE_ID` (opcional)
 4. **Persistent volume**:
    - Mount path: `/data`
+5. **Porta (healthcheck)**:
+   - Adicione a porta `3000` no Easypanel
+   - Target: `3000`
+   - Published: opcional
 
 > Não configure `SUPABASE_SERVICE_ROLE_KEY` neste worker. A credencial fica apenas no backend/proxy.
 
