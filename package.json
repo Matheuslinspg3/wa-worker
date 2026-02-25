@@ -1,0 +1,12 @@
+{
+  "name": "wa-worker",
+  "version": "1.0.0",
+  "description": "WhatsApp worker using Baileys + Supabase Edge Function proxy",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8"
+  }
+}
