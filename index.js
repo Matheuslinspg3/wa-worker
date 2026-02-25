@@ -11,6 +11,8 @@ const WORKER_SECRET = process.env.WORKER_SECRET
 const SESSION_DIR = `/data/${INSTANCE_ID}`
 const POLL_INTERVAL_MS = 2000
 const HTTP_TIMEOUT_MS = 10_000
+const RECONNECT_DELAY_MS = 2000
+const WORKER_HEARTBEAT_MS = 30000
 
 if (!EDGE_BASE_URL) {
   throw new Error('Missing required environment variable: EDGE_BASE_URL')
@@ -22,6 +24,9 @@ if (!WORKER_SECRET) {
 
 let sock
 let pollingInterval
+let reconnectTimeout
+
+setInterval(() => console.log('worker alive'), WORKER_HEARTBEAT_MS)
 
 function authHeaders() {
   return {
@@ -149,6 +154,19 @@ function stopPolling() {
   }
 }
 
+function scheduleReconnect() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout)
+  }
+
+  reconnectTimeout = setTimeout(() => {
+    connectToWhatsApp().catch((error) => {
+      console.error(`Reconnect failed: ${error.message}`)
+      scheduleReconnect()
+    })
+  }, RECONNECT_DELAY_MS)
+}
+
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR)
   const { version } = await fetchLatestBaileysVersion()
@@ -212,13 +230,10 @@ async function connectToWhatsApp() {
       console.log(`Connection closed (code: ${statusCode ?? 'unknown'})`)
 
       if (shouldReconnect) {
-        setTimeout(() => {
-          connectToWhatsApp().catch((error) => {
-            console.error(`Reconnect failed: ${error.message}`)
-          })
-        }, 2000)
+        scheduleReconnect()
       } else {
         console.log('Session logged out; waiting for manual re-authentication')
+        scheduleReconnect()
       }
     }
   })
@@ -226,5 +241,5 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp().catch((error) => {
   console.error(`Failed to initialize worker: ${error.message}`)
-  process.exit(1)
+  scheduleReconnect()
 })
