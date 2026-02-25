@@ -1,0 +1,8 @@
+# Ignora dependências instaladas localmente.
+node_modules
+
+# Ignora arquivo de variáveis sensíveis.
+.env
+
+# Ignora volume local de persistência de sessão.
+/data
