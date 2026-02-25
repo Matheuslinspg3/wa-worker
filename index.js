@@ -4,6 +4,7 @@ const {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } = require('@whiskeysockets/baileys')
+const QRCode = require('qrcode')
 
 const INSTANCE_ID = process.env.INSTANCE_ID || 'default'
 const EDGE_BASE_URL = process.env.EDGE_BASE_URL
@@ -174,7 +175,6 @@ async function connectToWhatsApp() {
   sock = makeWASocket({
     auth: state,
     version,
-    printQRInTerminal: true,
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -208,10 +208,19 @@ async function connectToWhatsApp() {
     }
   })
 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      console.log('QR generated')
-      await updateStatus('CONNECTING', qr).catch(() => {})
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect } = update
+
+    if (update.qr) {
+      const qrCodeBase64 = await QRCode.toDataURL(update.qr).catch((error) => {
+        console.error(`Failed to generate QR base64: ${error.message}`)
+        return null
+      })
+
+      if (qrCodeBase64) {
+        await updateStatus('CONNECTING', qrCodeBase64).catch(() => {})
+        console.log('QR generated')
+      }
     }
 
     if (connection === 'open') {
