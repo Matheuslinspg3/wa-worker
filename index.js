@@ -1,6 +1,8 @@
 const http = require('http')
+const fs = require('fs/promises')
 const {
   default: makeWASocket,
+  DisconnectReason,
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } = require('@whiskeysockets/baileys')
@@ -184,6 +186,15 @@ function scheduleReconnect(state) {
   }, RECONNECT_DELAY_MS)
 }
 
+async function removeAuthFolder(instanceId) {
+  const authPath = `/data/auth/${instanceId}`
+  try {
+    await fs.rm(authPath, { recursive: true, force: true })
+  } catch (error) {
+    console.error(`[wa] Failed to remove auth folder for ${instanceId}: ${error.message}`)
+  }
+}
+
 async function stopInstance(instanceId) {
   const state = instanceStates.get(instanceId)
   if (!state) {
@@ -287,12 +298,32 @@ async function connectInstance(instanceId) {
     }
 
     if (update.connection === 'close') {
+      const statusCode = update?.lastDisconnect?.error?.output?.statusCode
+      const mustResetAuth =
+        statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession
+
       state.connecting = false
       state.connected = false
       stopPolling(state)
       state.sock = null
 
       await updateStatus(instanceId, 'DISCONNECTED', null)
+
+      if (mustResetAuth) {
+        clearReconnect(state)
+        await removeAuthFolder(instanceId)
+        instanceStates.delete(instanceId)
+
+        if (desiredInstanceIds.has(instanceId)) {
+          connectInstance(instanceId).catch((error) => {
+            console.error(`[wa] Forced reconnect failed for ${instanceId}: ${error.message}`)
+            if (desiredInstanceIds.has(instanceId)) {
+              scheduleReconnect(createOrGetState(instanceId))
+            }
+          })
+        }
+        return
+      }
 
       if (state.intentionalStop || !desiredInstanceIds.has(instanceId)) {
         clearReconnect(state)
