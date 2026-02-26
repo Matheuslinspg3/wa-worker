@@ -13,6 +13,8 @@ Cada ciclo de descoberta (a cada 10s):
 2. Busca candidatas para conexão:
    - `GET /disconnected-instances?limit=50` → `{ instances:[{ id, priority }] }`
 3. Ordena por `priority` desc e mantém conectadas apenas as TOP N (`N = max_active_instances`).
+4. Só encerra instâncias fora da TOP N, que estejam rodando, respeitando cooldown mínimo de 60s desde `connectedAt`.
+5. Reconexão por instância com backoff progressivo: `2s, 5s, 10s, 20s, 40s, 60s` (cap em 60s).
 
 ## Variáveis de ambiente
 

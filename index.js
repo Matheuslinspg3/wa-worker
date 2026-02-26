@@ -15,9 +15,9 @@ const PORT = Number(process.env.PORT) || 3000
 const HTTP_TIMEOUT_MS = 10_000
 const DISCOVERY_INTERVAL_MS = 10_000
 const POLL_INTERVAL_MS = 2_000
-const RECONNECT_DELAY_MS = 2_000
 const KEEP_ALIVE_MS = 60_000
 const STOP_COOLDOWN_MS = 60_000
+const RECONNECT_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000]
 const MAX_ACTIVE_INSTANCES_FALLBACK = Math.max(0, Number(process.env.MAX_ACTIVE_INSTANCES) || 0)
 
 const instanceStates = new Map()
@@ -110,6 +110,7 @@ function createOrGetState(instanceId) {
       connecting: false,
       intentionalStop: false,
       reconnectTimeout: null,
+      reconnectAttempt: 0,
       pollingInterval: null,
       connectedAt: null,
     })
@@ -192,6 +193,10 @@ function clearReconnect(state) {
 function scheduleReconnect(state) {
   clearReconnect(state)
 
+  const delayIndex = Math.min(state.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
+  const delayMs = RECONNECT_DELAYS_MS[delayIndex]
+  state.reconnectAttempt += 1
+
   state.reconnectTimeout = setTimeout(() => {
     connectInstance(state.instanceId).catch((error) => {
       console.error(`[wa] Reconnect failed for ${state.instanceId}: ${error.message}`)
@@ -199,7 +204,7 @@ function scheduleReconnect(state) {
         scheduleReconnect(state)
       }
     })
-  }, RECONNECT_DELAY_MS)
+  }, delayMs)
 }
 
 async function removeAuthFolder(instanceId) {
@@ -234,6 +239,7 @@ async function stopInstance(instanceId) {
   state.sock = null
   state.connected = false
   state.connecting = false
+  state.reconnectAttempt = 0
   state.connectedAt = null
 
   await updateStatus(instanceId, 'DISCONNECTED', null)
@@ -291,6 +297,7 @@ async function connectInstance(instanceId) {
 
   state.intentionalStop = false
   state.connecting = true
+  state.reconnectAttempt = 0
   clearReconnect(state)
 
   const authPath = `/data/auth/${instanceId}`
@@ -348,6 +355,7 @@ async function connectInstance(instanceId) {
     if (update.connection === 'open') {
       state.connecting = false
       state.connected = true
+      state.reconnectAttempt = 0
       state.connectedAt = Date.now()
       await updateStatus(instanceId, 'CONNECTED', null)
       startPolling(state)
@@ -442,14 +450,8 @@ async function runDiscoveryCycle() {
       (state) => state.sock || state.connected || state.connecting,
     )
 
-    const runningNonTarget = runningStates.filter((state) => !targetIds.has(state.instanceId))
-    const excessCount = Math.max(0, runningStates.length - maxActiveInstances)
-
-    if (excessCount <= 0) {
-      return
-    }
-
-    const stopCandidates = runningNonTarget
+    const stopCandidates = runningStates
+      .filter((state) => !targetIds.has(state.instanceId))
       .filter((state) => canStopState(state, now))
       .sort((a, b) => {
         const priorityDiff =
@@ -461,8 +463,7 @@ async function runDiscoveryCycle() {
         return getStateConnectedAt(a) - getStateConnectedAt(b)
       })
 
-    const toStop = stopCandidates.slice(0, excessCount)
-    for (const state of toStop) {
+    for (const state of stopCandidates) {
       await stopInstance(state.instanceId)
     }
   } catch (error) {
