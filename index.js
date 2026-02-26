@@ -150,7 +150,20 @@ async function processQueuedMessages(state) {
           wa_message_id: sent?.key?.id ?? null,
         })
       } catch (error) {
-        console.error(`[poller] Failed to send message ${message.id} (${state.instanceId}): ${error.message}`)
+        const reason = error?.name === 'AbortError' ? 'timeout' : error?.message || 'unknown error'
+
+        await postJson('/mark-failed', {
+          messageId: message.id,
+          error: reason,
+        }).catch((markError) => {
+          const markReason =
+            markError?.name === 'AbortError' ? 'timeout' : markError?.message || 'unknown error'
+          console.error(
+            `[poller] Failed to mark message ${message.id} as FAILED (${state.instanceId}): ${markReason}`,
+          )
+        })
+
+        console.error(`[poller] Failed to send message ${message.id} (${state.instanceId}): ${reason}`)
       }
     }
   } catch (error) {
