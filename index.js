@@ -15,7 +15,7 @@ const POLL_INTERVAL_MS = 2000
 const HTTP_TIMEOUT_MS = 10_000
 const RECONNECT_DELAY_MS = 2000
 const WORKER_HEARTBEAT_MS = 30000
-const HEALTH_PORT = Number(process.env.PORT) || 3000
+const port = Number(process.env.PORT) || 3000
 
 http
   .createServer((req, res) => {
@@ -28,8 +28,8 @@ http
     res.writeHead(404)
     res.end()
   })
-  .listen(HEALTH_PORT, () => {
-    console.log(`health server listening on ${HEALTH_PORT}`)
+  .listen(port, '0.0.0.0', () => {
+    console.log(`HTTP server listening on ${port}`)
   })
 
 if (!EDGE_BASE_URL) {
