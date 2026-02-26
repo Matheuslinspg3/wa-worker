@@ -189,6 +189,19 @@ function clearReconnect(state) {
   }
 }
 
+function isInvalidSessionSignal(update) {
+  const statusCode = update?.lastDisconnect?.error?.output?.statusCode
+  if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession) {
+    return true
+  }
+
+  const errorText = String(update?.lastDisconnect?.error || '').toLowerCase()
+  return (
+    errorText.includes('not logged in, attempting registration') ||
+    errorText.includes('stream:error code 515')
+  )
+}
+
 function scheduleReconnect(state) {
   clearReconnect(state)
 
@@ -355,9 +368,7 @@ async function connectInstance(instanceId) {
     }
 
     if (update.connection === 'close') {
-      const statusCode = update?.lastDisconnect?.error?.output?.statusCode
-      const mustResetAuth =
-        statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession
+      const mustResetAuth = isInvalidSessionSignal(update)
 
       state.connecting = false
       state.connected = false
