@@ -24,6 +24,15 @@ const FALLBACK_MAX_ACTIVE_INSTANCES = Math.max(
   0,
   Number(process.env.MAX_ACTIVE_INSTANCES) || 0,
 )
+const BAD_MAC_WINDOW_MS = Math.max(1_000, Number(process.env.BAD_MAC_WINDOW_MS) || 60_000)
+const BAD_MAC_THRESHOLD = Math.max(1, Number(process.env.BAD_MAC_THRESHOLD) || 20)
+const BAD_MAC_COOLDOWN_MS = Math.max(10_000, Number(process.env.BAD_MAC_COOLDOWN_MS) || 300_000)
+
+const SIGNAL_SESSION_ERROR_SNIPPETS = [
+  'bad mac',
+  'failed to decrypt message',
+  'no matching sessions found',
+]
 
 process.on('uncaughtException', (error) => {
   console.error('[fatal] uncaughtException', error)
@@ -159,6 +168,11 @@ function shouldWipeAuth(update) {
   return serialized.includes('not logged in, attempting registration')
 }
 
+function isSignalSessionError(errorLike) {
+  const serialized = String(errorLike?.message || errorLike || '').toLowerCase()
+  return SIGNAL_SESSION_ERROR_SNIPPETS.some((snippet) => serialized.includes(snippet))
+}
+
 class OutboundQueueRunner {
   constructor(runtime, edgeClient) {
     this.runtime = runtime
@@ -245,6 +259,9 @@ class ConnectionRunner {
     this.intentionalStop = false
     this.reconnectAttempt = 0
     this.reconnectTimeout = null
+    this.badMacTimestamps = []
+    this.badMacBreakerUntil = 0
+    this.badMacBreakerRunning = false
     this.outbound = new OutboundQueueRunner(runtime, edgeClient)
   }
 
@@ -319,6 +336,7 @@ class ConnectionRunner {
         try {
           await this.edgeClient.post('/inbound', payload)
         } catch (error) {
+          this.registerSignalSessionError(error, 'inbound-delivery')
           console.error(
             `[inbound:${this.runtime.instanceId}] failed to deliver ${payload.wa_message_id}: ${normalizeReason(error)}`,
           )
@@ -341,6 +359,7 @@ class ConnectionRunner {
         this.connected = true
         this.connectedAt = Date.now()
         this.reconnectAttempt = 0
+        this.badMacTimestamps = []
         this.clearReconnect()
         console.log(`[conn:${this.runtime.instanceId}] open`)
         await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTED', null)
@@ -353,6 +372,7 @@ class ConnectionRunner {
         const statusCode = parseStatusCode(error)
         const reason = normalizeReason(error)
         const wipeAuth = shouldWipeAuth(update)
+        this.registerSignalSessionError(error, 'connection-close')
 
         console.log(
           `[conn:${this.runtime.instanceId}] close reason=${reason} statusCode=${statusCode || 'n/a'} wipeAuth=${wipeAuth}`,
@@ -380,6 +400,44 @@ class ConnectionRunner {
         this.scheduleReconnect()
       }
     })
+  }
+
+  registerSignalSessionError(errorLike, source) {
+    if (!isSignalSessionError(errorLike)) {
+      return
+    }
+
+    const now = Date.now()
+    this.badMacTimestamps.push(now)
+    this.badMacTimestamps = this.badMacTimestamps.filter((timestamp) => now - timestamp <= BAD_MAC_WINDOW_MS)
+
+    const count = this.badMacTimestamps.length
+    console.warn(
+      `[conn:${this.runtime.instanceId}] signal-session-error source=${source} count=${count}/${BAD_MAC_THRESHOLD} windowMs=${BAD_MAC_WINDOW_MS}`,
+    )
+
+    if (count < BAD_MAC_THRESHOLD) {
+      return
+    }
+
+    if (this.badMacBreakerRunning || now < this.badMacBreakerUntil) {
+      return
+    }
+
+    this.badMacBreakerRunning = true
+    this.badMacBreakerUntil = now + BAD_MAC_COOLDOWN_MS
+    this.tripBadMacCircuitBreaker(count).finally(() => {
+      this.badMacBreakerRunning = false
+    })
+  }
+
+  async tripBadMacCircuitBreaker(sampleCount) {
+    console.error(
+      `[conn:${this.runtime.instanceId}] bad-mac circuit breaker tripped count=${sampleCount} threshold=${BAD_MAC_THRESHOLD} windowMs=${BAD_MAC_WINDOW_MS}`,
+    )
+    this.badMacTimestamps = []
+    await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'DISCONNECTED', null)
+    await this.wipeAuthAndRestart('bad-mac-circuit-breaker')
   }
 
   async wipeAuthAndRestart(trigger) {
@@ -569,7 +627,7 @@ class InstanceManager {
           console.error(`[discovery] worker-settings unavailable: ${normalizeReason(error)}`)
           return null
         }),
-        this.edgeClient.get('/disconnected-instances?limit=50'),
+        this.edgeClient.get('/eligible-instances?enabled=true&limit=50&order=priority.desc'),
       ])
 
       const instancesRaw = Array.isArray(candidatesPayload?.instances)
@@ -578,7 +636,20 @@ class InstanceManager {
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
-      const targetIds = ordered.slice(0, maxActiveInstances).map((item) => String(item.id))
+      let targetIds = ordered.slice(0, maxActiveInstances).map((item) => String(item.id))
+
+      if (targetIds.length === 0 && maxActiveInstances > 0 && this.runtimes.size > 0) {
+        const runtimeFallback = [...this.runtimes.values()]
+          .sort((a, b) => (Number(b.priority) || 0) - (Number(a.priority) || 0))
+          .slice(0, maxActiveInstances)
+          .map((runtime) => runtime.instanceId)
+
+        if (runtimeFallback.length > 0) {
+          console.warn('[discovery] eligible-instances returned empty, preserving current runtimes as fallback targets')
+          targetIds = runtimeFallback
+        }
+      }
+
       this.desiredIds = new Set(targetIds)
 
       console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
