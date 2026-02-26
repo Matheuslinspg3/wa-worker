@@ -190,15 +190,39 @@ function clearReconnect(state) {
 }
 
 function isInvalidSessionSignal(update) {
-  const statusCode = update?.lastDisconnect?.error?.output?.statusCode
+  const disconnectError = update?.lastDisconnect?.error
+  const statusCode = disconnectError?.output?.statusCode
   if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession) {
     return true
   }
 
-  const errorText = String(update?.lastDisconnect?.error || '').toLowerCase()
+  const candidates = [
+    disconnectError,
+    disconnectError?.message,
+    disconnectError?.data,
+    disconnectError?.stack,
+    disconnectError?.output?.payload,
+  ]
+
+  const errorText = candidates
+    .map((item) => {
+      if (!item) {
+        return ''
+      }
+
+      if (typeof item === 'string') {
+        return item
+      }
+
+      return JSON.stringify(item)
+    })
+    .join(' ')
+    .toLowerCase()
+
   return (
     errorText.includes('not logged in, attempting registration') ||
-    errorText.includes('stream:error code 515')
+    errorText.includes('stream:error code 515') ||
+    errorText.includes('stream:error code 515:')
   )
 }
 
