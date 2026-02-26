@@ -17,6 +17,8 @@ const DISCOVERY_INTERVAL_MS = 10_000
 const POLL_INTERVAL_MS = 2_000
 const RECONNECT_DELAY_MS = 2_000
 const KEEP_ALIVE_MS = 60_000
+const STOP_COOLDOWN_MS = 60_000
+const MAX_ACTIVE_INSTANCES_FALLBACK = Math.max(0, Number(process.env.MAX_ACTIVE_INSTANCES) || 0)
 
 const instanceStates = new Map()
 let desiredInstanceIds = new Set()
@@ -109,6 +111,7 @@ function createOrGetState(instanceId) {
       intentionalStop: false,
       reconnectTimeout: null,
       pollingInterval: null,
+      connectedAt: null,
     })
   }
 
@@ -231,8 +234,48 @@ async function stopInstance(instanceId) {
   state.sock = null
   state.connected = false
   state.connecting = false
+  state.connectedAt = null
 
   await updateStatus(instanceId, 'DISCONNECTED', null)
+}
+
+function getMaxActiveInstances(settings) {
+  const configured = Number(settings?.max_active_instances)
+  if (Number.isFinite(configured) && configured >= 0) {
+    return configured
+  }
+
+  return MAX_ACTIVE_INSTANCES_FALLBACK
+}
+
+function getStatePriority(state, priorityByInstanceId) {
+  const mappedPriority = priorityByInstanceId.get(state.instanceId)
+  if (mappedPriority !== undefined) {
+    return mappedPriority
+  }
+
+  return Number(state.priority) || 0
+}
+
+function getStateConnectedAt(state) {
+  if (typeof state.connectedAt === 'number') {
+    return state.connectedAt
+  }
+
+  return 0
+}
+
+function canStopState(state, now) {
+  if (!state.connected) {
+    return true
+  }
+
+  const connectedAt = getStateConnectedAt(state)
+  if (!connectedAt) {
+    return true
+  }
+
+  return now - connectedAt >= STOP_COOLDOWN_MS
 }
 
 async function connectInstance(instanceId) {
@@ -305,6 +348,7 @@ async function connectInstance(instanceId) {
     if (update.connection === 'open') {
       state.connecting = false
       state.connected = true
+      state.connectedAt = Date.now()
       await updateStatus(instanceId, 'CONNECTED', null)
       startPolling(state)
       return
@@ -317,6 +361,7 @@ async function connectInstance(instanceId) {
 
       state.connecting = false
       state.connected = false
+      state.connectedAt = null
       stopPolling(state)
       state.sock = null
 
@@ -352,11 +397,15 @@ async function connectInstance(instanceId) {
 async function runDiscoveryCycle() {
   try {
     const [settings, disconnectedPayload] = await Promise.all([
-      getJson('/worker-settings'),
+      getJson('/worker-settings').catch((error) => {
+        const reason = error.name === 'AbortError' ? 'timeout' : error.message
+        console.error(`[discovery] Failed to fetch /worker-settings: ${reason}`)
+        return null
+      }),
       getJson('/disconnected-instances?limit=50'),
     ])
 
-    const maxActiveInstances = Math.max(0, Number(settings?.max_active_instances) || 0)
+    const maxActiveInstances = getMaxActiveInstances(settings)
     const instances = Array.isArray(disconnectedPayload?.instances)
       ? disconnectedPayload.instances
       : []
@@ -366,7 +415,11 @@ async function runDiscoveryCycle() {
       .sort((a, b) => (Number(b?.priority) || 0) - (Number(a?.priority) || 0))
 
     const top = prioritized.slice(0, maxActiveInstances)
-    desiredInstanceIds = new Set(top.map((item) => String(item.id)))
+    const targetIds = new Set(top.map((item) => String(item.id)))
+    desiredInstanceIds = targetIds
+    const priorityByInstanceId = new Map(
+      prioritized.map((item) => [String(item.id), Number(item.priority) || 0]),
+    )
 
     for (const item of top) {
       const instanceId = String(item.id)
@@ -384,11 +437,33 @@ async function runDiscoveryCycle() {
       }
     }
 
-    const runningIds = Array.from(instanceStates.keys())
-    for (const instanceId of runningIds) {
-      if (!desiredInstanceIds.has(instanceId)) {
-        await stopInstance(instanceId)
-      }
+    const now = Date.now()
+    const runningStates = Array.from(instanceStates.values()).filter(
+      (state) => state.sock || state.connected || state.connecting,
+    )
+
+    const runningNonTarget = runningStates.filter((state) => !targetIds.has(state.instanceId))
+    const excessCount = Math.max(0, runningStates.length - maxActiveInstances)
+
+    if (excessCount <= 0) {
+      return
+    }
+
+    const stopCandidates = runningNonTarget
+      .filter((state) => canStopState(state, now))
+      .sort((a, b) => {
+        const priorityDiff =
+          getStatePriority(a, priorityByInstanceId) - getStatePriority(b, priorityByInstanceId)
+        if (priorityDiff !== 0) {
+          return priorityDiff
+        }
+
+        return getStateConnectedAt(a) - getStateConnectedAt(b)
+      })
+
+    const toStop = stopCandidates.slice(0, excessCount)
+    for (const state of toStop) {
+      await stopInstance(state.instanceId)
     }
   } catch (error) {
     const reason = error.name === 'AbortError' ? 'timeout' : error.message
