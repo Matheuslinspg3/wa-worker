@@ -157,15 +157,15 @@ function shouldWipeAuth(update) {
     return true
   }
 
-  if (statusCode === 515) {
-    return true
-  }
-
   if (serialized.includes('bad session')) {
     return true
   }
 
-  return serialized.includes('not logged in, attempting registration')
+  return false
+}
+
+function randomBetween(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min
 }
 
 function isSignalSessionError(errorLike) {
@@ -372,6 +372,7 @@ class ConnectionRunner {
         const statusCode = parseStatusCode(error)
         const reason = normalizeReason(error)
         const wipeAuth = shouldWipeAuth(update)
+        const isRestartRequired = statusCode === 515
         this.registerSignalSessionError(error, 'connection-close')
 
         console.log(
@@ -397,7 +398,11 @@ class ConnectionRunner {
           return
         }
 
-        this.scheduleReconnect()
+        const reconnectDelay = isRestartRequired ? randomBetween(2_000, 5_000) : null
+        this.scheduleReconnect({
+          delayMs: reconnectDelay,
+          trigger: isRestartRequired ? 'statusCode-515-restart-required' : 'connection-close',
+        })
       }
     })
   }
@@ -459,11 +464,15 @@ class ConnectionRunner {
     await this.runtime.manager.ensureRunning(this.runtime.instanceId)
   }
 
-  scheduleReconnect() {
+  scheduleReconnect({ delayMs = null, trigger = 'unknown' } = {}) {
     this.clearReconnect()
     const index = Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
-    const delay = RECONNECT_DELAYS_MS[index]
+    const delay = delayMs ?? RECONNECT_DELAYS_MS[index]
     this.reconnectAttempt += 1
+
+    console.log(
+      `[conn:${this.runtime.instanceId}] reconnect scheduled trigger=${trigger} delayMs=${delay} attempt=${this.reconnectAttempt}`,
+    )
 
     this.reconnectTimeout = setTimeout(() => {
       this.runtime.manager.ensureRunning(this.runtime.instanceId).catch((error) => {
