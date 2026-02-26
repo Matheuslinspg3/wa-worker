@@ -14,28 +14,32 @@ const SESSION_DIR = `/data/${INSTANCE_ID}`
 const POLL_INTERVAL_MS = 2000
 const HTTP_TIMEOUT_MS = 10_000
 const RECONNECT_DELAY_MS = 2000
-const WORKER_HEARTBEAT_MS = 30000
 const KEEP_ALIVE_MS = 60_000
 const port = Number(process.env.PORT) || 3000
 
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err)
+})
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err)
+})
+
 async function start() {
-  process.on('uncaughtException', console.error)
-  process.on('unhandledRejection', console.error)
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' })
+      res.end('ok')
+      return
+    }
 
-  http
-    .createServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' })
-        res.end('ok')
-        return
-      }
+    res.writeHead(404)
+    res.end()
+  })
 
-      res.writeHead(404)
-      res.end()
-    })
-    .listen(port, '0.0.0.0', () => {
-      console.log(`HTTP server listening on ${port}`)
-    })
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`HTTP server listening on ${port}`)
+  })
 
   if (!EDGE_BASE_URL) {
     console.error('Missing required environment variable: EDGE_BASE_URL')
@@ -49,8 +53,9 @@ async function start() {
   let pollingInterval
   let reconnectTimeout
 
-  setInterval(() => console.log('worker alive'), WORKER_HEARTBEAT_MS)
-  setInterval(() => {}, KEEP_ALIVE_MS)
+  setInterval(() => {
+    console.log('worker alive')
+  }, KEEP_ALIVE_MS)
 
   function authHeaders() {
     return {
