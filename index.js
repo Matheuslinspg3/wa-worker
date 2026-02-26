@@ -148,6 +148,45 @@ function extractBody(message) {
   )
 }
 
+function normalizeDigits(value) {
+  return String(value || '').replace(/\D/g, '')
+}
+
+function normalizeOutboundTo(message) {
+  const originalTo = String(message?.to || '').trim()
+
+  if (!originalTo) {
+    return { error: 'missing-to', originalTo, toNormalized: null }
+  }
+
+  if (originalTo.includes('@g.us') || originalTo.includes('@s.whatsapp.net')) {
+    return { originalTo, toNormalized: originalTo }
+  }
+
+  if (originalTo.includes('@lid')) {
+    const toPnDigits = normalizeDigits(message?.to_pn)
+    if (!toPnDigits) {
+      return {
+        error: 'lid-without-to_pn',
+        originalTo,
+        toNormalized: null,
+      }
+    }
+
+    return {
+      originalTo,
+      toNormalized: `${toPnDigits}@s.whatsapp.net`,
+    }
+  }
+
+  const digits = normalizeDigits(originalTo)
+  if (digits && digits === originalTo) {
+    return { originalTo, toNormalized: `${digits}@s.whatsapp.net` }
+  }
+
+  return { originalTo, toNormalized: originalTo }
+}
+
 function shouldWipeAuth(update) {
   const error = update?.lastDisconnect?.error
   const statusCode = parseStatusCode(error)
@@ -223,8 +262,26 @@ class OutboundQueueRunner {
           continue
         }
 
+        const { originalTo, toNormalized, error: toError } = normalizeOutboundTo(queued)
+
+        if (toError) {
+          const reason = `invalid-destination:${toError}`
+          try {
+            await this.edgeClient.post('/mark-failed', {
+              messageId: queued.id,
+              error: reason,
+            })
+          } catch {
+            console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
+          }
+          console.error(
+            `[queue:${this.runtime.instanceId}] send skipped for ${queued.id}: ${reason} toOriginal=${originalTo} toNormalized=${toNormalized}`,
+          )
+          continue
+        }
+
         try {
-          const sent = await this.runtime.sock.sendMessage(queued.to, { text: queued.body })
+          const sent = await this.runtime.sock.sendMessage(toNormalized, { text: queued.body })
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
             wa_message_id: sent?.key?.id || null,
@@ -239,7 +296,9 @@ class OutboundQueueRunner {
           } catch {
             console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
           }
-          console.error(`[queue:${this.runtime.instanceId}] send failed for ${queued.id}: ${reason}`)
+          console.error(
+            `[queue:${this.runtime.instanceId}] send failed for ${queued.id}: ${reason} toOriginal=${originalTo} toNormalized=${toNormalized}`,
+          )
         }
       }
     } finally {
@@ -316,9 +375,20 @@ class ConnectionRunner {
 
       for (const message of messages) {
         const chatIdRaw = message?.key?.remoteJid || null
-        const senderId = message?.key?.participant || chatIdRaw
+        const participantRaw =
+          message?.key?.participant || message?.participantPn || message?.participantLid || null
+        const senderId = participantRaw || chatIdRaw
+        const toId = this.sock?.user?.id || null
+        const body = extractBody(message).trim()
+        if (!body) {
+          continue
+        }
+
         const payload = {
           instanceId: this.runtime.instanceId,
+          from: senderId,
+          to: toId,
+          body,
           chat_id: chatIdRaw,
           chat_id_raw: chatIdRaw,
           chat_id_norm: chatIdRaw,
@@ -326,10 +396,9 @@ class ConnectionRunner {
           sender_id: senderId,
           wa_message_id: message?.key?.id || null,
           timestamp: parseTimestamp(message),
-          body: extractBody(message),
         }
 
-        if (!payload.chat_id || !payload.sender_id || !payload.wa_message_id) {
+        if (!payload.from || !payload.to || !payload.body || !payload.wa_message_id) {
           continue
         }
 
