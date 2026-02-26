@@ -15,7 +15,16 @@ const POLL_INTERVAL_MS = 2000
 const HTTP_TIMEOUT_MS = 10_000
 const RECONNECT_DELAY_MS = 2000
 const WORKER_HEARTBEAT_MS = 30000
+const KEEP_ALIVE_MS = 60_000
 const port = Number(process.env.PORT) || 3000
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT:', err)
+})
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED:', err)
+})
 
 http
   .createServer((req, res) => {
@@ -33,11 +42,11 @@ http
   })
 
 if (!EDGE_BASE_URL) {
-  throw new Error('Missing required environment variable: EDGE_BASE_URL')
+  console.error('Missing required environment variable: EDGE_BASE_URL')
 }
 
 if (!WORKER_SECRET) {
-  throw new Error('Missing required environment variable: WORKER_SECRET')
+  console.error('Missing required environment variable: WORKER_SECRET')
 }
 
 let sock
@@ -45,6 +54,7 @@ let pollingInterval
 let reconnectTimeout
 
 setInterval(() => console.log('worker alive'), WORKER_HEARTBEAT_MS)
+setInterval(() => {}, KEEP_ALIVE_MS)
 
 function authHeaders() {
   return {
@@ -264,13 +274,14 @@ async function connectToWhatsApp() {
         scheduleReconnect()
       } else {
         console.log('Session logged out; waiting for manual re-authentication')
-        scheduleReconnect()
       }
     }
   })
 }
 
-connectToWhatsApp().catch((error) => {
-  console.error(`Failed to initialize worker: ${error.message}`)
-  scheduleReconnect()
-})
+if (EDGE_BASE_URL && WORKER_SECRET) {
+  connectToWhatsApp().catch((error) => {
+    console.error(`Failed to initialize worker: ${error.message}`)
+    scheduleReconnect()
+  })
+}
