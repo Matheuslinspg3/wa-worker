@@ -189,6 +189,52 @@ function clearReconnect(state) {
   }
 }
 
+function normalizeChatId(chatId) {
+  if (typeof chatId !== 'string') {
+    return ''
+  }
+
+  if (
+    chatId.endsWith('@g.us') ||
+    chatId.endsWith('@s.whatsapp.net') ||
+    chatId.endsWith('@lid')
+  ) {
+    return chatId
+  }
+
+  return chatId
+}
+
+function parseMessageTimestamp(message) {
+  const rawTimestamp = message?.messageTimestamp
+
+  if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)) {
+    return rawTimestamp
+  }
+
+  if (typeof rawTimestamp === 'string') {
+    const parsed = Number(rawTimestamp)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+
+  if (typeof rawTimestamp === 'object' && rawTimestamp) {
+    if (typeof rawTimestamp.toNumber === 'function') {
+      const parsed = rawTimestamp.toNumber()
+      if (Number.isFinite(parsed)) {
+        return parsed
+      }
+    }
+
+    if (typeof rawTimestamp.low === 'number') {
+      return rawTimestamp.low
+    }
+  }
+
+  return null
+}
+
 function scheduleReconnect(state) {
   clearReconnect(state)
 
@@ -312,25 +358,31 @@ async function connectInstance(instanceId) {
     }
 
     for (const message of messages) {
-      const from = message?.key?.remoteJid
-      const to = message?.key?.participant || sock?.user?.id || null
+      const fromMe = Boolean(message?.key?.fromMe)
+      const chatId = message?.key?.remoteJid || null
+      const senderId = message?.key?.participant || message?.key?.remoteJid || null
       const body =
         message?.message?.conversation ||
         message?.message?.extendedTextMessage?.text ||
         message?.message?.imageMessage?.caption ||
         message?.message?.videoMessage?.caption ||
         ''
+      const chatIdNorm = normalizeChatId(chatId)
+      const timestamp = parseMessageTimestamp(message)
 
-      if (!from || !body) {
+      if (!chatId || !senderId || !body) {
         continue
       }
 
       await postJson('/inbound', {
         instanceId,
-        from,
-        to,
+        from_me: fromMe,
+        chat_id: chatId,
+        chat_id_norm: chatIdNorm,
+        sender_id: senderId,
         body,
         wa_message_id: message?.key?.id || null,
+        timestamp,
       }).catch(() => {})
     }
   })
