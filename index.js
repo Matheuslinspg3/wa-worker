@@ -15,9 +15,9 @@ const PORT = Number(process.env.PORT) || 3000
 const HTTP_TIMEOUT_MS = 10_000
 const DISCOVERY_INTERVAL_MS = 10_000
 const POLL_INTERVAL_MS = 2_000
-const RECONNECT_DELAY_MS = 2_000
 const KEEP_ALIVE_MS = 60_000
 const STOP_COOLDOWN_MS = 60_000
+const RECONNECT_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000]
 const MAX_ACTIVE_INSTANCES_FALLBACK = Math.max(0, Number(process.env.MAX_ACTIVE_INSTANCES) || 0)
 
 const instanceStates = new Map()
@@ -110,6 +110,7 @@ function createOrGetState(instanceId) {
       connecting: false,
       intentionalStop: false,
       reconnectTimeout: null,
+      reconnectAttempt: 0,
       pollingInterval: null,
       connectedAt: null,
     })
@@ -189,45 +190,58 @@ function clearReconnect(state) {
   }
 }
 
-function isInvalidSessionSignal(update) {
-  const disconnectError = update?.lastDisconnect?.error
-  const statusCode = disconnectError?.output?.statusCode
-  if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession) {
-    return true
+function normalizeChatId(chatId) {
+  if (typeof chatId !== 'string') {
+    return ''
   }
 
-  const candidates = [
-    disconnectError,
-    disconnectError?.message,
-    disconnectError?.data,
-    disconnectError?.stack,
-    disconnectError?.output?.payload,
-  ]
+  if (
+    chatId.endsWith('@g.us') ||
+    chatId.endsWith('@s.whatsapp.net') ||
+    chatId.endsWith('@lid')
+  ) {
+    return chatId
+  }
 
-  const errorText = candidates
-    .map((item) => {
-      if (!item) {
-        return ''
+  return chatId
+}
+
+function parseMessageTimestamp(message) {
+  const rawTimestamp = message?.messageTimestamp
+
+  if (typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)) {
+    return rawTimestamp
+  }
+
+  if (typeof rawTimestamp === 'string') {
+    const parsed = Number(rawTimestamp)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+
+  if (typeof rawTimestamp === 'object' && rawTimestamp) {
+    if (typeof rawTimestamp.toNumber === 'function') {
+      const parsed = rawTimestamp.toNumber()
+      if (Number.isFinite(parsed)) {
+        return parsed
       }
+    }
 
-      if (typeof item === 'string') {
-        return item
-      }
+    if (typeof rawTimestamp.low === 'number') {
+      return rawTimestamp.low
+    }
+  }
 
-      return JSON.stringify(item)
-    })
-    .join(' ')
-    .toLowerCase()
-
-  return (
-    errorText.includes('not logged in, attempting registration') ||
-    errorText.includes('stream:error code 515') ||
-    errorText.includes('stream:error code 515:')
-  )
+  return null
 }
 
 function scheduleReconnect(state) {
   clearReconnect(state)
+
+  const delayIndex = Math.min(state.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
+  const delayMs = RECONNECT_DELAYS_MS[delayIndex]
+  state.reconnectAttempt += 1
 
   state.reconnectTimeout = setTimeout(() => {
     connectInstance(state.instanceId).catch((error) => {
@@ -236,7 +250,7 @@ function scheduleReconnect(state) {
         scheduleReconnect(state)
       }
     })
-  }, RECONNECT_DELAY_MS)
+  }, delayMs)
 }
 
 async function removeAuthFolder(instanceId) {
@@ -271,6 +285,7 @@ async function stopInstance(instanceId) {
   state.sock = null
   state.connected = false
   state.connecting = false
+  state.reconnectAttempt = 0
   state.connectedAt = null
 
   await updateStatus(instanceId, 'DISCONNECTED', null)
@@ -328,6 +343,7 @@ async function connectInstance(instanceId) {
 
   state.intentionalStop = false
   state.connecting = true
+  state.reconnectAttempt = 0
   clearReconnect(state)
 
   const authPath = `/data/auth/${instanceId}`
@@ -349,25 +365,31 @@ async function connectInstance(instanceId) {
     }
 
     for (const message of messages) {
-      const from = message?.key?.remoteJid
-      const to = message?.key?.participant || sock?.user?.id || null
+      const fromMe = Boolean(message?.key?.fromMe)
+      const chatId = message?.key?.remoteJid || null
+      const senderId = message?.key?.participant || message?.key?.remoteJid || null
       const body =
         message?.message?.conversation ||
         message?.message?.extendedTextMessage?.text ||
         message?.message?.imageMessage?.caption ||
         message?.message?.videoMessage?.caption ||
         ''
+      const chatIdNorm = normalizeChatId(chatId)
+      const timestamp = parseMessageTimestamp(message)
 
-      if (!from || !body) {
+      if (!chatId || !senderId || !body) {
         continue
       }
 
       await postJson('/inbound', {
         instanceId,
-        from,
-        to,
+        from_me: fromMe,
+        chat_id: chatId,
+        chat_id_norm: chatIdNorm,
+        sender_id: senderId,
         body,
         wa_message_id: message?.key?.id || null,
+        timestamp,
       }).catch(() => {})
     }
   })
@@ -385,6 +407,7 @@ async function connectInstance(instanceId) {
     if (update.connection === 'open') {
       state.connecting = false
       state.connected = true
+      state.reconnectAttempt = 0
       state.connectedAt = Date.now()
       await updateStatus(instanceId, 'CONNECTED', null)
       startPolling(state)
@@ -477,14 +500,8 @@ async function runDiscoveryCycle() {
       (state) => state.sock || state.connected || state.connecting,
     )
 
-    const runningNonTarget = runningStates.filter((state) => !targetIds.has(state.instanceId))
-    const excessCount = Math.max(0, runningStates.length - maxActiveInstances)
-
-    if (excessCount <= 0) {
-      return
-    }
-
-    const stopCandidates = runningNonTarget
+    const stopCandidates = runningStates
+      .filter((state) => !targetIds.has(state.instanceId))
       .filter((state) => canStopState(state, now))
       .sort((a, b) => {
         const priorityDiff =
@@ -496,8 +513,7 @@ async function runDiscoveryCycle() {
         return getStateConnectedAt(a) - getStateConnectedAt(b)
       })
 
-    const toStop = stopCandidates.slice(0, excessCount)
-    for (const state of toStop) {
+    for (const state of stopCandidates) {
       await stopInstance(state.instanceId)
     }
   } catch (error) {
