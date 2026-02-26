@@ -17,7 +17,7 @@ Worker de WhatsApp (Baileys) com suporte a **multi-instância robusta**, persist
 A cada `DISCOVERY_POLL_MS`:
 
 1. `GET /worker-settings` → `{ max_active_instances }`
-2. `GET /disconnected-instances?limit=50` → `{ instances:[{ id, priority }] }`
+2. `GET /eligible-instances?enabled=true&limit=50&order=priority.desc` (ou equivalente) → `{ instances:[{ id, priority }] }`
 3. Calcula `targetIds = TOP N` por prioridade (ordem estável para empates).
 4. Chama `ensureRunning(id)` para cada `targetId`.
 5. Chama `stopGracefully(id)` somente para runtime fora do target (com cooldown de 60s quando conectado).
@@ -30,7 +30,8 @@ A cada `DISCOVERY_POLL_MS`:
   - Open: `POST /update-status { status: "CONNECTED", qr_code: null }`
   - Close: `POST /update-status { status: "DISCONNECTED", qr_code: null }`
 - Reconexão com backoff por instância e reset no open.
-- Wipe de auth **somente** em sinais de sessão inválida/logged out/stream 515.
+- Wipe de auth em sinais de sessão inválida/logged out/stream 515.
+- Circuit breaker para corrupção de sessão Signal (`Bad MAC`/falha de decrypt): ao exceder `BAD_MAC_THRESHOLD` em `BAD_MAC_WINDOW_MS`, marca `DISCONNECTED`, limpa auth local e força novo QR.
 
 ### 3) OutboundQueueRunner (por instância conectada)
 
@@ -70,6 +71,9 @@ No `messages.upsert` (`type=notify`) envia para `/inbound`:
 - `QUEUE_POLL_MS` (opcional, default `2000`)
 - `AUTH_BASE` (opcional, default `/data/auth`)
 - `MAX_ACTIVE_INSTANCES` (fallback opcional se backend não retornar setting)
+- `BAD_MAC_WINDOW_MS` (opcional, default `60000`)
+- `BAD_MAC_THRESHOLD` (opcional, default `20`)
+- `BAD_MAC_COOLDOWN_MS` (opcional, default `300000`)
 
 ## Persistência (obrigatória)
 
@@ -84,7 +88,7 @@ Estrutura esperada por instância:
 Com base no `EDGE_BASE_URL`:
 
 - `GET /worker-settings`
-- `GET /disconnected-instances?limit=50`
+- `GET /eligible-instances?enabled=true&limit=50&order=priority.desc`
 - `POST /update-status`
 - `GET /queued-messages?instanceId=<instanceId>`
 - `POST /mark-sent`
