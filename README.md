@@ -1,25 +1,35 @@
 # wa-worker
 
-Worker de WhatsApp (Baileys) com persistência local de sessão em volume e integração via **Edge Functions proxy**.
+Worker de WhatsApp (Baileys) com suporte a **multi-instância**, persistência local de sessão por instância e integração via **Edge Functions proxy**.
 
 ## Arquitetura
 
 Este worker **não usa Supabase Service Role diretamente**. Em vez disso, ele faz chamadas HTTP para um proxy em Edge Functions usando `WORKER_SECRET`.
 
-### Variáveis de ambiente
+Cada ciclo de descoberta (a cada 10s):
+
+1. Busca configurações do backend:
+   - `GET /worker-settings` → `{ max_active_instances }`
+2. Busca candidatas para conexão:
+   - `GET /disconnected-instances?limit=50` → `{ instances:[{ id, priority }] }`
+3. Ordena por `priority` desc e mantém conectadas apenas as TOP N (`N = max_active_instances`).
+
+## Variáveis de ambiente
 
 - `EDGE_BASE_URL` (obrigatória)
   - Ex: `https://<project>.supabase.co/functions/v1/worker-proxy`
 - `WORKER_SECRET` (obrigatória)
   - Enviada no header: `Authorization: Bearer <WORKER_SECRET>`
-- `INSTANCE_ID` (opcional)
-  - Default: `default`
+- `PORT` (opcional)
+  - Default: `3000`
 
-## Persistência de sessão
+> `INSTANCE_ID` **não é mais usado**.
 
-A sessão do Baileys é salva em:
+## Persistência de sessão (obrigatória)
 
-- `/data/<INSTANCE_ID>`
+A autenticação do Baileys é salva por instância em:
+
+- `/data/auth/<instanceId>`
 
 Em deploy, monte um volume persistente em `/data`.
 
@@ -27,10 +37,35 @@ Em deploy, monte um volume persistente em `/data`.
 
 Com base no `EDGE_BASE_URL`:
 
+- `GET /worker-settings`
+- `GET /disconnected-instances?limit=50`
 - `POST /update-status`
-- `GET /queued-messages?instanceId=<INSTANCE_ID>`
+- `GET /queued-messages?instanceId=<instanceId>`
 - `POST /mark-sent`
 - `POST /inbound`
+
+## Health server
+
+- Bind: `0.0.0.0`
+- Porta: `PORT` (default `3000`)
+- Endpoint: `GET /health` → `ok`
+
+## Fluxo de status por instância
+
+- QR disponível:
+  - `POST /update-status` com `{ instanceId, status:"CONNECTING", qr_code:<dataURL> }`
+- Conectada:
+  - `POST /update-status` com `{ instanceId, status:"CONNECTED", qr_code:null }`
+- Desconectada:
+  - `POST /update-status` com `{ instanceId, status:"DISCONNECTED", qr_code:null }`
+
+## Outbound por instância conectada
+
+Cada instância conectada faz polling da fila:
+
+1. `GET /queued-messages?instanceId=...`
+2. Envia mensagem via `sock.sendMessage`
+3. Confirma com `POST /mark-sent`
 
 ## Configuração no Easypanel
 
@@ -39,53 +74,13 @@ Com base no `EDGE_BASE_URL`:
 3. **Environment variables**:
    - `EDGE_BASE_URL`
    - `WORKER_SECRET`
-   - `INSTANCE_ID` (opcional)
-4. **Persistent volume**:
+   - `PORT` (opcional)
+4. **Persistent volume obrigatório**:
    - Mount path: `/data`
 5. **Porta (healthcheck)**:
-   - Adicione a porta `3000` no Easypanel
-   - Target: `3000`
-   - Published: opcional
+   - Adicione a porta `3000` (ou a definida em `PORT`)
 
 > Não configure `SUPABASE_SERVICE_ROLE_KEY` neste worker. A credencial fica apenas no backend/proxy.
-
-## Exemplos de chamadas (curl)
-
-> Use valores fictícios localmente e **nunca** exponha seu segredo real.
-
-### update-status
-
-```bash
-curl -X POST "$EDGE_BASE_URL/update-status" \
-  -H "Authorization: Bearer $WORKER_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"instanceId":"default","status":"CONNECTING","qr_code":null}'
-```
-
-### queued-messages
-
-```bash
-curl "$EDGE_BASE_URL/queued-messages?instanceId=default" \
-  -H "Authorization: Bearer $WORKER_SECRET"
-```
-
-### mark-sent
-
-```bash
-curl -X POST "$EDGE_BASE_URL/mark-sent" \
-  -H "Authorization: Bearer $WORKER_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"messageId":"123","wa_message_id":"wamid.HBg..."}'
-```
-
-### inbound
-
-```bash
-curl -X POST "$EDGE_BASE_URL/inbound" \
-  -H "Authorization: Bearer $WORKER_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"instanceId":"default","from":"5511999999999@s.whatsapp.net","to":"5511888888888@s.whatsapp.net","body":"oi","wa_message_id":"wamid.HBg..."}'
-```
 
 ## Execução local
 
