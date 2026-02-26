@@ -35,7 +35,7 @@ Com base no `EDGE_BASE_URL`:
 ## Configuração no Easypanel
 
 1. **Build/Runtime**: Node.js (ou Dockerfile deste repositório)
-2. **Command**: `npm start`
+2. **Command**: `node index.js`
 3. **Environment variables**:
    - `EDGE_BASE_URL`
    - `WORKER_SECRET`
@@ -90,5 +90,5 @@ curl -X POST "$EDGE_BASE_URL/inbound" \
 ## Execução local
 
 ```bash
-npm start
+node index.js
 ```
