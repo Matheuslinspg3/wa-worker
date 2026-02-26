@@ -415,9 +415,7 @@ async function connectInstance(instanceId) {
     }
 
     if (update.connection === 'close') {
-      const statusCode = update?.lastDisconnect?.error?.output?.statusCode
-      const mustResetAuth =
-        statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession
+      const mustResetAuth = isInvalidSessionSignal(update)
 
       state.connecting = false
       state.connected = false
