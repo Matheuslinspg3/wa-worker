@@ -107,36 +107,6 @@ function parseStatusCode(error) {
   )
 }
 
-function parseTimestamp(message) {
-  const raw = message?.messageTimestamp
-
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    return raw
-  }
-
-  if (typeof raw === 'string') {
-    const parsed = Number(raw)
-    if (Number.isFinite(parsed)) {
-      return parsed
-    }
-  }
-
-  if (raw && typeof raw === 'object') {
-    if (typeof raw.toNumber === 'function') {
-      const parsed = raw.toNumber()
-      if (Number.isFinite(parsed)) {
-        return parsed
-      }
-    }
-
-    if (typeof raw.low === 'number') {
-      return raw.low
-    }
-  }
-
-  return null
-}
-
 function extractBody(message) {
   return (
     message?.message?.conversation ||
@@ -146,6 +116,10 @@ function extractBody(message) {
     message?.message?.documentMessage?.caption ||
     ''
   )
+}
+
+function resolvePushName(upsert, message) {
+  return upsert?.pushName || message?.pushName || null
 }
 
 function normalizeDigits(value) {
@@ -368,7 +342,8 @@ class ConnectionRunner {
   bindEvents(saveCreds) {
     this.sock.ev.on('creds.update', saveCreds)
 
-    this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    this.sock.ev.on('messages.upsert', async (upsert) => {
+      const { messages, type } = upsert
       if (type !== 'notify') {
         return
       }
@@ -383,23 +358,25 @@ class ConnectionRunner {
         if (!body) {
           continue
         }
+        const pushName = resolvePushName(upsert, message)
 
         const payload = {
           instanceId: this.runtime.instanceId,
           from: senderId,
           to: toId,
           body,
-          chat_id: chatIdRaw,
-          chat_id_raw: chatIdRaw,
-          chat_id_norm: chatIdRaw,
-          from_me: Boolean(message?.key?.fromMe),
-          sender_id: senderId,
+          push_name: pushName,
           wa_message_id: message?.key?.id || null,
-          timestamp: parseTimestamp(message),
         }
 
         if (!payload.from || !payload.to || !payload.body || !payload.wa_message_id) {
           continue
+        }
+
+        if (payload.push_name) {
+          console.log(
+            `[inbound] instance=${this.runtime.instanceId} from=${payload.from} push_name=${payload.push_name}`,
+          )
         }
 
         try {
