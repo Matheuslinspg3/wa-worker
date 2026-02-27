@@ -607,21 +607,34 @@ class ConnectionRunner {
         if (!chatIdNorm) continue
 
         const isGroup = chatIdNorm.endsWith('@g.us')
-        const senderJidRaw = isGroup ? key.participant || chatIdNorm : chatIdNorm
+        const senderJidRaw = isGroup
+          ? key.participant || chatIdNorm
+          : key.fromMe
+            ? this.sock?.user?.id || chatIdNorm
+            : chatIdNorm
+        const contactJid =
+          key.fromMe && senderJidRaw === this.sock?.user?.id ? chatIdNorm : senderJidRaw
+
+        console.log('[identity]', {
+          chatId: chatIdNorm,
+          senderJid: senderJidRaw,
+          fromMe: !!key.fromMe,
+          sockUser: this.sock?.user?.id,
+        })
         const pushName = resolvePushName(upsert, msg)
 
         let senderContactId = null
         try {
           const resolved = await this.edgeClient.resolveContact({
             instanceId,
-            jid: senderJidRaw,
-            jid_type: resolveJidType(senderJidRaw),
+            jid: contactJid,
+            jid_type: resolveJidType(contactJid),
             push_name: pushName,
           })
           senderContactId = resolved?.contact_id || resolved?.id || null
         } catch (error) {
           console.warn(
-            `[contact-resolve:${instanceId}] failed jid=${senderJidRaw} error=${normalizeReason(error)}`,
+            `[contact-resolve:${instanceId}] failed jid=${contactJid} error=${normalizeReason(error)}`,
           )
         }
 
