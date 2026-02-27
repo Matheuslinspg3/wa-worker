@@ -49,7 +49,8 @@ Normalização de destino outbound:
 
 - número puro `5511999999999` → `5511999999999@s.whatsapp.net`
 - id de grupo `1203630...-1234567890` → `...@g.us`
-- `@lid` sem `to_pn` alternativo → falha com `mark-failed`
+- `@lid` → resolve via `GET /resolve-lid?instanceId=...&jid=...`; se retornar `jid_pn`, usa `jid_pn` como destino
+- `@lid` sem resolução (`jid_pn`) → falha com `mark-failed` (`invalid-destination:lid`)
 
 > Nunca envia outbound se a instância não estiver `CONNECTED`.
 
@@ -113,6 +114,8 @@ Com base no `EDGE_BASE_URL`:
 - `POST /mark-sent`
 - `POST /mark-failed` (opcional, recomendado)
 - `POST /inbound`
+- `POST /upsert-contact` (quando detectar par `jid_lid` + `jid_pn` no inbound)
+- `GET /resolve-lid?instanceId=<instanceId>&jid=<jid@lid>`
 - `POST /upload-media` (obrigatório para inbound de mídia)
 
 ### Contrato recomendado para `POST /upload-media` (worker-proxy)
