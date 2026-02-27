@@ -5,6 +5,7 @@ Worker de WhatsApp (Baileys) com suporte a **multi-instância robusta**, persist
 ## O que este worker faz
 
 - Mantém até `N` instâncias ativas (`max_active_instances`) com priorização estável por `priority`.
+- Aplica trava distribuída por `instance_id` com renovação de TTL para evitar bootstrap duplicado entre processos.
 - Evita thrash de scheduler (não recria socket já ativo e só para fora do target com cooldown de 60s).
 - Faz reconexão com backoff por instância (`2s,5s,10s,20s,40s,60s`).
 - Processa outbound com marcação confiável (`mark-sent` / `mark-failed`).
@@ -23,6 +24,10 @@ A cada `DISCOVERY_POLL_MS`:
 4. Chama `ensureRunning(id)` para cada `targetId`.
 5. Chama `stopGracefully(id)` somente para runtime fora do target (com cooldown de 60s quando conectado).
 
+Antes de iniciar conexão/handlers, o worker tenta adquirir lock distribuído (`/instance-lock/acquire`).
+Se houver conflito (`lock_conflict`), a instância não inicia neste processo.
+Locks adquiridos são renovados em background (`/instance-lock/renew`) até shutdown.
+
 ### 2) ConnectionRunner (por instância)
 
 - Auth state em: `useMultiFileAuthState(/data/auth/<instanceId>)`.
@@ -33,6 +38,7 @@ A cada `DISCOVERY_POLL_MS`:
 - Reconexão com backoff por instância e reset no open.
 - Wipe de auth em sinais de sessão inválida/logged out/stream 515.
 - Circuit breaker para corrupção de sessão Signal (`Bad MAC`/falha de decrypt): ao exceder `BAD_MAC_THRESHOLD` em `BAD_MAC_WINDOW_MS`, marca `DISCONNECTED`, limpa auth local e força novo QR.
+- Reconciliação de identidade PN/LID por instância (`/data/auth/<instanceId>/identity-alias-map.json`) para evitar sessão duplicada para o mesmo usuário.
 
 ### 3) OutboundQueueRunner (por instância conectada)
 
@@ -65,6 +71,7 @@ No `messages.upsert` (`type=notify`) envia para `/inbound`:
 - `chat_id` (obrigatório): `message.key.remoteJid`
 - `chat_type`: `group` quando `chat_id` termina com `@g.us`, senão `direct`
 - `sender_jid_raw` (obrigatório): grupo=`key.participant`, privado=`key.remoteJid`
+- `sender_pn` (opcional): JID canônico de pessoa (`@s.whatsapp.net`) quando disponível
 - `sender_contact_id` (opcional): resolvido via `POST /contacts/resolve` com `{ instanceId, jid, jid_type, push_name }`
   - Para reduzir ruído por conflito de unicidade no backend (`contacts_instance_id_jid_key`), o worker aplica cache local por `instanceId+jid` e cooldown quando detecta duplicata.
   - Mensagens `fromMe` não fazem `contacts/resolve` (define `sender_contact_id = null`) para evitar resolve redundante do próprio usuário.
@@ -80,6 +87,8 @@ Regras:
 - Se não houver `body` **e** não houver mídia, o worker não envia `/inbound`.
 - Para mídia, o arquivo é salvo em `/data/media/<instanceId>/<wa_message_id>.<ext>` e depois enviado ao proxy via `POST /upload-media` (Bearer `WORKER_SECRET`).
 - O worker não loga bytes/base64 de mídia.
+- Para identidade, o worker prioriza `senderPn` (`@s.whatsapp.net`) como canônico e mantém `@lid` como alias persistido por instância.
+- Em erro `No matching sessions found`, o worker faz refresh controlado de sessão/prekey via `POST /sessions/refresh` com backoff e limite (`DECRYPT_RETRY_MAX_ATTEMPTS`), emitindo logs de fallback (`identity_alias_resolved`, `session_refreshed`, `decrypt_retry_exhausted`).
 
 ## Variáveis de ambiente
 
@@ -90,6 +99,8 @@ Regras:
 - `PORT` (opcional, default `3000`)
 - `DISCOVERY_POLL_MS` (opcional, default `10000`)
 - `QUEUE_POLL_MS` (opcional, default `2000`)
+- `INSTANCE_LOCK_TTL_MS` (opcional, default `30000`)
+- `INSTANCE_LOCK_RENEW_MS` (opcional, default `INSTANCE_LOCK_TTL_MS/2`, mínimo `2000`)
 - `AUTH_BASE` (opcional, default `/data/auth`)
 - `MEDIA_BASE` (opcional, default `/data/media`)
 - `MAX_ACTIVE_INSTANCES` (fallback opcional se backend não retornar setting)
@@ -122,6 +133,7 @@ Com base no `EDGE_BASE_URL`:
 - `POST /contacts/resolve`
 - `GET /contacts/primary-jid?instanceId=<instanceId>&jid=<jid@lid>`
 - `POST /upload-media` (obrigatório para inbound de mídia)
+- `POST /sessions/refresh` (recomendado para fallback de sessão/prekey)
 
 ### Contrato recomendado para `POST /upload-media` (worker-proxy)
 

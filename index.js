@@ -35,6 +35,11 @@ const HTTP_TIMEOUT_MS = 10_000
 const KEEP_ALIVE_MS = 60_000
 const STOP_COOLDOWN_MS = 60_000
 const RECONNECT_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000]
+const LOCK_TTL_MS = Math.max(5_000, Number(process.env.INSTANCE_LOCK_TTL_MS) || 30_000)
+const LOCK_RENEW_INTERVAL_MS = Math.max(
+  2_000,
+  Math.min(LOCK_TTL_MS - 1_000, Number(process.env.INSTANCE_LOCK_RENEW_MS) || Math.floor(LOCK_TTL_MS / 2)),
+)
 const FALLBACK_MAX_ACTIVE_INSTANCES = Math.max(
   0,
   Number(process.env.MAX_ACTIVE_INSTANCES) || 0,
@@ -57,12 +62,56 @@ const SIGNAL_SESSION_ERROR_SNIPPETS = [
   'no matching sessions found',
 ]
 
+const PROCESS_OWNER_ID = `${process.env.INSTANCE_OWNER_PREFIX || process.env.HOSTNAME || 'worker'}:${process.pid}`
+
+let instanceManager = null
+let shutdownPromise = null
+
+async function gracefulShutdown(signal, { fatalError = null } = {}) {
+  if (shutdownPromise) {
+    return shutdownPromise
+  }
+
+  shutdownPromise = (async () => {
+    console.log(`[shutdown] signal=${signal} owner=${PROCESS_OWNER_ID}`)
+
+    if (instanceManager) {
+      await instanceManager.shutdown({ signal, fatalError })
+    }
+
+    if (fatalError) {
+      console.error('[shutdown] fatal error', fatalError)
+      process.exit(1)
+    }
+  })().finally(() => {
+    shutdownPromise = null
+  })
+
+  return shutdownPromise
+}
+
 process.on('uncaughtException', (error) => {
   console.error('[fatal] uncaughtException', error)
+  gracefulShutdown('uncaughtException', { fatalError: error }).catch((shutdownError) => {
+    console.error('[shutdown] uncaughtException cleanup failed', shutdownError)
+    process.exit(1)
+  })
 })
 
 process.on('unhandledRejection', (error) => {
   console.error('[fatal] unhandledRejection', error)
+  gracefulShutdown('unhandledRejection', { fatalError: error }).catch((shutdownError) => {
+    console.error('[shutdown] unhandledRejection cleanup failed', shutdownError)
+    process.exit(1)
+  })
+})
+
+process.on('SIGTERM', () => {
+  gracefulShutdown('SIGTERM').then(() => process.exit(0))
+})
+
+process.on('SIGINT', () => {
+  gracefulShutdown('SIGINT').then(() => process.exit(0))
 })
 
 function authHeaders() {
@@ -90,7 +139,10 @@ async function requestJson(method, endpoint, body) {
 
     if (!response.ok) {
       const details = await safeReadBody(response)
-      throw new Error(`HTTP ${response.status}${details ? `: ${details.slice(0, 220)}` : ''}`)
+      const error = new Error(`HTTP ${response.status}${details ? `: ${details.slice(0, 220)}` : ''}`)
+      error.statusCode = response.status
+      error.responseBody = details
+      throw error
     }
 
     if (response.status === 204) {
@@ -101,6 +153,48 @@ async function requestJson(method, endpoint, body) {
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function isContactResolveConflict(error) {
+  const statusCode = Number(error?.statusCode || error?.status || 0)
+  const rawBody = typeof error?.responseBody === 'string' ? error.responseBody : ''
+  const normalizedBody = rawBody.toLowerCase()
+
+  if (statusCode === 409) {
+    return true
+  }
+
+  if (statusCode === 500) {
+    return (
+      normalizedBody.includes('contacts_instance_id_jid_key') ||
+      normalizedBody.includes('duplicate key value') ||
+      normalizedBody.includes('23505')
+    )
+  }
+
+  return false
+}
+
+function resolveContactOperation(result) {
+  const op = String(result?.operation || result?.outcome || result?.status || '').toLowerCase()
+
+  if (['created', 'updated', 'already_exists'].includes(op)) {
+    return op
+  }
+
+  return 'created'
+}
+
+function logContactResolve(instanceId, jid, operation, extra = {}) {
+  console.log(
+    JSON.stringify({
+      event: 'contact_resolve',
+      instanceId,
+      jid,
+      operation,
+      ...extra,
+    }),
+  )
 }
 
 function normalizeReason(error) {
@@ -356,9 +450,91 @@ function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function isSignalSessionError(errorLike) {
   const serialized = String(errorLike?.message || errorLike || '').toLowerCase()
   return SIGNAL_SESSION_ERROR_SNIPPETS.some((snippet) => serialized.includes(snippet))
+}
+
+class IdentityAliasStore {
+  constructor(filePath) {
+    this.filePath = filePath
+    this.loaded = false
+    this.data = { lid_to_pn: {}, pn_to_lid: {} }
+  }
+
+  async load() {
+    if (this.loaded) {
+      return
+    }
+
+    this.loaded = true
+    try {
+      const raw = await fs.readFile(this.filePath, 'utf8')
+      const parsed = JSON.parse(raw)
+      this.data = {
+        lid_to_pn: parsed?.lid_to_pn || {},
+        pn_to_lid: parsed?.pn_to_lid || {},
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        console.warn(`[identity-map] load failed path=${this.filePath} reason=${normalizeReason(error)}`)
+      }
+    }
+  }
+
+  async save() {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true })
+    await fs.writeFile(this.filePath, JSON.stringify(this.data), 'utf8')
+  }
+
+  async rememberPair(jidLid, jidPn) {
+    await this.load()
+
+    const lid = String(jidLid || '').trim()
+    const pn = String(jidPn || '').trim()
+    if (!lid || !pn || !lid.endsWith('@lid') || !pn.endsWith('@s.whatsapp.net')) {
+      return false
+    }
+
+    const changed = this.data.lid_to_pn[lid] !== pn || this.data.pn_to_lid[pn] !== lid
+    this.data.lid_to_pn[lid] = pn
+    this.data.pn_to_lid[pn] = lid
+
+    if (changed) {
+      await this.save()
+    }
+
+    return changed
+  }
+
+  async resolveCanonical(jid, fallbackPn = null) {
+    await this.load()
+
+    const normalizedJid = String(jid || '').trim()
+    const normalizedFallbackPn = String(fallbackPn || '').trim()
+
+    if (normalizedFallbackPn.endsWith('@s.whatsapp.net')) {
+      return normalizedFallbackPn
+    }
+
+    if (!normalizedJid) {
+      return normalizedJid
+    }
+
+    if (normalizedJid.endsWith('@s.whatsapp.net')) {
+      return normalizedJid
+    }
+
+    if (normalizedJid.endsWith('@lid')) {
+      return this.data.lid_to_pn[normalizedJid] || normalizedJid
+    }
+
+    return normalizedJid
+  }
 }
 
 class OutboundQueueRunner {
@@ -396,6 +572,45 @@ class OutboundQueueRunner {
     }
 
     return normalized
+  }
+
+  async sendWithSessionRecovery(toNormalized, queued) {
+    let attempt = 0
+
+    while (attempt <= DECRYPT_RETRY_MAX_ATTEMPTS) {
+      const targetJid = await this.runtime.connection.resolveCanonicalJid(toNormalized)
+      try {
+        return await this.sendOutboundMessage(targetJid, queued)
+      } catch (error) {
+        if (!isSignalSessionError(error)) {
+          throw error
+        }
+
+        const isNoMatchingSession = String(error?.message || error || '')
+          .toLowerCase()
+          .includes('no matching sessions found')
+        const canRetry = isNoMatchingSession && attempt < DECRYPT_RETRY_MAX_ATTEMPTS
+
+        if (!canRetry) {
+          console.warn(
+            `[fallback] reason=decrypt_retry_exhausted instance=${this.runtime.instanceId} jid=${targetJid} attempts=${attempt + 1}`,
+          )
+          throw error
+        }
+
+        const retryAttempt = attempt + 1
+        const backoffMs = SESSION_REFRESH_BACKOFF_MS[Math.min(attempt, SESSION_REFRESH_BACKOFF_MS.length - 1)]
+        console.warn(
+          `[fallback] reason=session_refresh_attempt instance=${this.runtime.instanceId} jid=${targetJid} attempt=${retryAttempt} backoffMs=${backoffMs}`,
+        )
+        await this.runtime.connection.refreshSessionForJid(targetJid)
+        await sleep(backoffMs)
+      }
+
+      attempt += 1
+    }
+
+    throw new Error('decrypt-retry-loop-exhausted')
   }
 
   start() {
@@ -473,7 +688,7 @@ class OutboundQueueRunner {
         }
 
         try {
-          const result = await this.sendOutboundMessage(toNormalized, queued)
+          const result = await this.sendWithSessionRecovery(toNormalized, queued)
           console.log('[send-result]', JSON.stringify(result))
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
@@ -606,6 +821,40 @@ class ConnectionRunner {
     }
   }
 
+  async resolveCanonicalJid(jid, senderPn = null) {
+    const canonicalJid = await this.identityAliasStore.resolveCanonical(jid, senderPn)
+    const originalJid = String(jid || '').trim()
+
+    if (canonicalJid !== originalJid) {
+      console.log(
+        `[fallback] reason=identity_alias_resolved instance=${this.runtime.instanceId} from=${originalJid} to=${canonicalJid}`,
+      )
+    }
+
+    return canonicalJid
+  }
+
+  async rememberIdentityAlias(jidLid, jidPn) {
+    const changed = await this.identityAliasStore.rememberPair(jidLid, jidPn)
+    if (changed) {
+      console.log(
+        `[identity] alias-updated instance=${this.runtime.instanceId} lid=${jidLid} pn=${jidPn}`,
+      )
+    }
+  }
+
+  async refreshSessionForJid(jid) {
+    const canonical = await this.resolveCanonicalJid(jid)
+    await this.edgeClient.refreshSession({
+      instanceId: this.runtime.instanceId,
+      jid: canonical,
+      trigger: 'no_matching_sessions',
+    })
+    console.log(
+      `[fallback] reason=session_refreshed instance=${this.runtime.instanceId} jid=${canonical}`,
+    )
+  }
+
   async connect() {
     if (this.connecting || this.connected || this.sock) {
       return
@@ -712,6 +961,17 @@ class ConnectionRunner {
         const chatIdNorm = key?.remoteJid
         if (!chatIdNorm) continue
 
+        const lidPnPair = extractLidPnPair(msg)
+        if (lidPnPair?.jid_lid && lidPnPair?.jid_pn) {
+          try {
+            await this.rememberIdentityAlias(lidPnPair.jid_lid, lidPnPair.jid_pn)
+          } catch (error) {
+            console.warn(
+              `[identity] alias-save-failed instance=${instanceId} lid=${lidPnPair.jid_lid} pn=${lidPnPair.jid_pn} error=${normalizeReason(error)}`,
+            )
+          }
+        }
+
         const isGroup = chatIdNorm.endsWith('@g.us')
         const senderJidRaw = isGroup
           ? key.participant || chatIdNorm
@@ -726,6 +986,9 @@ class ConnectionRunner {
         console.log('[identity]', {
           chatId: chatIdNorm,
           senderJid: senderJidRaw,
+          senderPn,
+          chatIdCanonical,
+          senderJidCanonical,
           fromMe: !!key.fromMe,
           sockUser: this.sock?.user?.id,
         })
@@ -781,8 +1044,9 @@ class ConnectionRunner {
           body,
           wa_message_id: key.id || null,
           from_me: !!key.fromMe,
-          chat_id_norm: chatIdNorm,
-          sender_jid_raw: senderJidRaw,
+          chat_id_norm: chatIdCanonical,
+          sender_jid_raw: senderJidCanonical,
+          sender_pn: senderPn,
           sender_contact_id: senderContactId,
           push_name: pushName,
           media_type: mediaType,
@@ -1003,6 +1267,10 @@ class EdgeClient {
     return this.post('/upload-media', payload)
   }
 
+  async refreshSession(payload) {
+    return this.post('/sessions/refresh', payload)
+  }
+
   async safeUpdateStatus(instanceId, status, qrCode) {
     try {
       await this.post('/update-status', {
@@ -1012,6 +1280,191 @@ class EdgeClient {
       })
     } catch (error) {
       console.error(`[status:${instanceId}] update failed (${status}): ${normalizeReason(error)}`)
+    }
+  }
+
+  async acquireInstanceLock({ instanceId, instanceOwner, ttlMs }) {
+    return this.post('/instance-lock/acquire', {
+      instanceId,
+      instance_owner: instanceOwner,
+      ttl_ms: ttlMs,
+    })
+  }
+
+  async renewInstanceLock({ instanceId, instanceOwner, ttlMs, lockToken }) {
+    return this.post('/instance-lock/renew', {
+      instanceId,
+      instance_owner: instanceOwner,
+      ttl_ms: ttlMs,
+      lock_token: lockToken || null,
+    })
+  }
+
+  async releaseInstanceLock({ instanceId, instanceOwner, lockToken }) {
+    return this.post('/instance-lock/release', {
+      instanceId,
+      instance_owner: instanceOwner,
+      lock_token: lockToken || null,
+    })
+  }
+}
+
+function parseLockPayload(payload) {
+  const acquired = payload?.acquired ?? payload?.lock_acquired ?? false
+  const owner = payload?.instance_owner || payload?.owner || null
+  const lockToken = payload?.lock_token || payload?.token || null
+  return {
+    acquired: Boolean(acquired),
+    owner,
+    lockToken,
+  }
+}
+
+class InstanceLockCoordinator {
+  constructor(edgeClient, { onLockLost }) {
+    this.edgeClient = edgeClient
+    this.onLockLost = onLockLost
+    this.ownership = new Map()
+  }
+
+  getOwner(instanceId) {
+    return this.ownership.get(instanceId)?.instanceOwner || null
+  }
+
+  hasOwnership(instanceId) {
+    return this.ownership.has(instanceId)
+  }
+
+  async acquire(instanceId) {
+    const response = await this.edgeClient.acquireInstanceLock({
+      instanceId,
+      instanceOwner: PROCESS_OWNER_ID,
+      ttlMs: LOCK_TTL_MS,
+    })
+
+    const { acquired, owner, lockToken } = parseLockPayload(response)
+    if (!acquired) {
+      console.warn(
+        `[lock_conflict] instance=${instanceId} instance_owner=${owner || 'unknown'} requester=${PROCESS_OWNER_ID}`,
+      )
+      return false
+    }
+
+    this.setOwnership(instanceId, {
+      instanceOwner: owner || PROCESS_OWNER_ID,
+      lockToken,
+    })
+
+    console.log(
+      `[lock_acquired] instance=${instanceId} instance_owner=${this.getOwner(instanceId)} ttlMs=${LOCK_TTL_MS}`,
+    )
+    return true
+  }
+
+  setOwnership(instanceId, { instanceOwner, lockToken }) {
+    const current = this.ownership.get(instanceId)
+    if (current?.renewInterval) {
+      clearInterval(current.renewInterval)
+    }
+
+    const state = {
+      instanceOwner,
+      lockToken,
+      renewInterval: setInterval(() => {
+        this.renew(instanceId).catch((error) => {
+          console.error(`[lock_renew_error] instance=${instanceId} error=${normalizeReason(error)}`)
+        })
+      }, LOCK_RENEW_INTERVAL_MS),
+    }
+
+    this.ownership.set(instanceId, state)
+  }
+
+  async renew(instanceId) {
+    const state = this.ownership.get(instanceId)
+    if (!state) {
+      return false
+    }
+
+    const response = await this.edgeClient.renewInstanceLock({
+      instanceId,
+      instanceOwner: state.instanceOwner,
+      ttlMs: LOCK_TTL_MS,
+      lockToken: state.lockToken,
+    })
+    const { acquired, owner, lockToken } = parseLockPayload(response)
+
+    if (!acquired) {
+      console.error(
+        `[lock_conflict] instance=${instanceId} instance_owner=${owner || 'unknown'} requester=${PROCESS_OWNER_ID}`,
+      )
+      await this.clearOwnership(instanceId, { releaseRemote: false })
+      await this.onLockLost(instanceId)
+      return false
+    }
+
+    state.lockToken = lockToken || state.lockToken
+    if (owner) {
+      state.instanceOwner = owner
+    }
+    console.log(`[instance_owner] instance=${instanceId} instance_owner=${state.instanceOwner}`)
+    return true
+  }
+
+  async release(instanceId, { reason = 'unknown' } = {}) {
+    const state = this.ownership.get(instanceId)
+    if (!state) {
+      return false
+    }
+
+    try {
+      await this.edgeClient.releaseInstanceLock({
+        instanceId,
+        instanceOwner: state.instanceOwner,
+        lockToken: state.lockToken,
+      })
+    } catch (error) {
+      console.error(
+        `[lock_release_error] instance=${instanceId} reason=${reason} error=${normalizeReason(error)}`,
+      )
+    }
+
+    await this.clearOwnership(instanceId, { releaseRemote: false })
+    console.log(`[lock_released] instance=${instanceId} reason=${reason}`)
+    return true
+  }
+
+  async clearOwnership(instanceId, { releaseRemote = true } = {}) {
+    const state = this.ownership.get(instanceId)
+    if (!state) {
+      return
+    }
+
+    if (state.renewInterval) {
+      clearInterval(state.renewInterval)
+    }
+
+    this.ownership.delete(instanceId)
+
+    if (!releaseRemote) {
+      return
+    }
+
+    try {
+      await this.edgeClient.releaseInstanceLock({
+        instanceId,
+        instanceOwner: state.instanceOwner,
+        lockToken: state.lockToken,
+      })
+    } catch (error) {
+      console.error(`[lock_release_error] instance=${instanceId} error=${normalizeReason(error)}`)
+    }
+  }
+
+  async releaseAll({ reason = 'shutdown' } = {}) {
+    const ids = [...this.ownership.keys()]
+    for (const instanceId of ids) {
+      await this.release(instanceId, { reason })
     }
   }
 }
@@ -1045,6 +1498,12 @@ class InstanceManager {
     this.desiredIds = new Set()
     this.discoveryInterval = null
     this.discoveryRunning = false
+    this.isShuttingDown = false
+    this.lockCoordinator = new InstanceLockCoordinator(this.edgeClient, {
+      onLockLost: async (instanceId) => {
+        await this.handleLockLost(instanceId)
+      },
+    })
   }
 
   isDesired(instanceId) {
@@ -1063,13 +1522,25 @@ class InstanceManager {
   }
 
   async ensureRunning(instanceId) {
+    if (!this.lockCoordinator.hasOwnership(instanceId)) {
+      const acquired = await this.lockCoordinator.acquire(instanceId)
+      if (!acquired) {
+        return false
+      }
+    }
+
     const runtime = this.getOrCreateRuntime(instanceId)
     if (runtime.isBusy() || runtime.sock) {
       return false
     }
 
-    await runtime.connection.connect()
-    return true
+    try {
+      await runtime.connection.connect()
+      return true
+    } catch (error) {
+      await this.lockCoordinator.release(instanceId, { reason: 'connect-failure' })
+      throw error
+    }
   }
 
   canStop(runtime) {
@@ -1087,12 +1558,19 @@ class InstanceManager {
   async stopGracefully(instanceId) {
     const runtime = this.runtimes.get(instanceId)
     if (!runtime) {
+      await this.lockCoordinator.release(instanceId, { reason: 'runtime-missing' })
       return false
     }
 
     await runtime.connection.stopGracefully()
     this.runtimes.delete(instanceId)
+    await this.lockCoordinator.release(instanceId, { reason: 'stop-gracefully' })
     return true
+  }
+
+  async handleLockLost(instanceId) {
+    console.error(`[lock_lost] instance=${instanceId} requester=${PROCESS_OWNER_ID}`)
+    await this.stopGracefully(instanceId)
   }
 
   stablePrioritize(instances) {
@@ -1199,10 +1677,32 @@ class InstanceManager {
     await fs.mkdir(AUTH_BASE, { recursive: true })
     await this.discoveryCycle()
     this.discoveryInterval = setInterval(() => {
+      if (this.isShuttingDown) {
+        return
+      }
       this.discoveryCycle().catch((error) => {
         console.error(`[discovery] cycle crash: ${normalizeReason(error)}`)
       })
     }, DISCOVERY_POLL_MS)
+  }
+
+  async shutdown({ signal }) {
+    this.isShuttingDown = true
+    if (this.discoveryInterval) {
+      clearInterval(this.discoveryInterval)
+      this.discoveryInterval = null
+    }
+
+    const runtimeIds = [...this.runtimes.keys()]
+    for (const instanceId of runtimeIds) {
+      try {
+        await this.stopGracefully(instanceId)
+      } catch (error) {
+        console.error(`[shutdown] stop failed instance=${instanceId} error=${normalizeReason(error)}`)
+      }
+    }
+
+    await this.lockCoordinator.releaseAll({ reason: signal || 'shutdown' })
   }
 }
 
@@ -1247,6 +1747,7 @@ async function start() {
   }
 
   const manager = new InstanceManager()
+  instanceManager = manager
   await manager.start()
   await new Promise(() => {})
 }
