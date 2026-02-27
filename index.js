@@ -42,6 +42,8 @@ const FALLBACK_MAX_ACTIVE_INSTANCES = Math.max(
 const BAD_MAC_WINDOW_MS = Math.max(1_000, Number(process.env.BAD_MAC_WINDOW_MS) || 60_000)
 const BAD_MAC_THRESHOLD = Math.max(1, Number(process.env.BAD_MAC_THRESHOLD) || 20)
 const BAD_MAC_COOLDOWN_MS = Math.max(10_000, Number(process.env.BAD_MAC_COOLDOWN_MS) || 300_000)
+const DECRYPT_RETRY_MAX_ATTEMPTS = Math.max(1, Number(process.env.DECRYPT_RETRY_MAX_ATTEMPTS) || 2)
+const SESSION_REFRESH_BACKOFF_MS = [500, 1_000, 2_000]
 
 const SIGNAL_SESSION_ERROR_SNIPPETS = [
   'bad mac',
@@ -318,9 +320,91 @@ function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function isSignalSessionError(errorLike) {
   const serialized = String(errorLike?.message || errorLike || '').toLowerCase()
   return SIGNAL_SESSION_ERROR_SNIPPETS.some((snippet) => serialized.includes(snippet))
+}
+
+class IdentityAliasStore {
+  constructor(filePath) {
+    this.filePath = filePath
+    this.loaded = false
+    this.data = { lid_to_pn: {}, pn_to_lid: {} }
+  }
+
+  async load() {
+    if (this.loaded) {
+      return
+    }
+
+    this.loaded = true
+    try {
+      const raw = await fs.readFile(this.filePath, 'utf8')
+      const parsed = JSON.parse(raw)
+      this.data = {
+        lid_to_pn: parsed?.lid_to_pn || {},
+        pn_to_lid: parsed?.pn_to_lid || {},
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        console.warn(`[identity-map] load failed path=${this.filePath} reason=${normalizeReason(error)}`)
+      }
+    }
+  }
+
+  async save() {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true })
+    await fs.writeFile(this.filePath, JSON.stringify(this.data), 'utf8')
+  }
+
+  async rememberPair(jidLid, jidPn) {
+    await this.load()
+
+    const lid = String(jidLid || '').trim()
+    const pn = String(jidPn || '').trim()
+    if (!lid || !pn || !lid.endsWith('@lid') || !pn.endsWith('@s.whatsapp.net')) {
+      return false
+    }
+
+    const changed = this.data.lid_to_pn[lid] !== pn || this.data.pn_to_lid[pn] !== lid
+    this.data.lid_to_pn[lid] = pn
+    this.data.pn_to_lid[pn] = lid
+
+    if (changed) {
+      await this.save()
+    }
+
+    return changed
+  }
+
+  async resolveCanonical(jid, fallbackPn = null) {
+    await this.load()
+
+    const normalizedJid = String(jid || '').trim()
+    const normalizedFallbackPn = String(fallbackPn || '').trim()
+
+    if (normalizedFallbackPn.endsWith('@s.whatsapp.net')) {
+      return normalizedFallbackPn
+    }
+
+    if (!normalizedJid) {
+      return normalizedJid
+    }
+
+    if (normalizedJid.endsWith('@s.whatsapp.net')) {
+      return normalizedJid
+    }
+
+    if (normalizedJid.endsWith('@lid')) {
+      return this.data.lid_to_pn[normalizedJid] || normalizedJid
+    }
+
+    return normalizedJid
+  }
 }
 
 class OutboundQueueRunner {
@@ -358,6 +442,45 @@ class OutboundQueueRunner {
     }
 
     return normalized
+  }
+
+  async sendWithSessionRecovery(toNormalized, queued) {
+    let attempt = 0
+
+    while (attempt <= DECRYPT_RETRY_MAX_ATTEMPTS) {
+      const targetJid = await this.runtime.connection.resolveCanonicalJid(toNormalized)
+      try {
+        return await this.sendOutboundMessage(targetJid, queued)
+      } catch (error) {
+        if (!isSignalSessionError(error)) {
+          throw error
+        }
+
+        const isNoMatchingSession = String(error?.message || error || '')
+          .toLowerCase()
+          .includes('no matching sessions found')
+        const canRetry = isNoMatchingSession && attempt < DECRYPT_RETRY_MAX_ATTEMPTS
+
+        if (!canRetry) {
+          console.warn(
+            `[fallback] reason=decrypt_retry_exhausted instance=${this.runtime.instanceId} jid=${targetJid} attempts=${attempt + 1}`,
+          )
+          throw error
+        }
+
+        const retryAttempt = attempt + 1
+        const backoffMs = SESSION_REFRESH_BACKOFF_MS[Math.min(attempt, SESSION_REFRESH_BACKOFF_MS.length - 1)]
+        console.warn(
+          `[fallback] reason=session_refresh_attempt instance=${this.runtime.instanceId} jid=${targetJid} attempt=${retryAttempt} backoffMs=${backoffMs}`,
+        )
+        await this.runtime.connection.refreshSessionForJid(targetJid)
+        await sleep(backoffMs)
+      }
+
+      attempt += 1
+    }
+
+    throw new Error('decrypt-retry-loop-exhausted')
   }
 
   start() {
@@ -435,7 +558,7 @@ class OutboundQueueRunner {
         }
 
         try {
-          const result = await this.sendOutboundMessage(toNormalized, queued)
+          const result = await this.sendWithSessionRecovery(toNormalized, queued)
           console.log('[send-result]', JSON.stringify(result))
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
@@ -545,6 +668,7 @@ class ConnectionRunner {
     this.badMacTimestamps = []
     this.badMacBreakerUntil = 0
     this.badMacBreakerRunning = false
+    this.identityAliasStore = new IdentityAliasStore(path.join(this.authPath, 'identity-alias-map.json'))
     this.outbound = new OutboundQueueRunner(runtime, edgeClient)
   }
 
@@ -565,6 +689,40 @@ class ConnectionRunner {
       clearTimeout(this.reconnectTimeout)
       this.reconnectTimeout = null
     }
+  }
+
+  async resolveCanonicalJid(jid, senderPn = null) {
+    const canonicalJid = await this.identityAliasStore.resolveCanonical(jid, senderPn)
+    const originalJid = String(jid || '').trim()
+
+    if (canonicalJid !== originalJid) {
+      console.log(
+        `[fallback] reason=identity_alias_resolved instance=${this.runtime.instanceId} from=${originalJid} to=${canonicalJid}`,
+      )
+    }
+
+    return canonicalJid
+  }
+
+  async rememberIdentityAlias(jidLid, jidPn) {
+    const changed = await this.identityAliasStore.rememberPair(jidLid, jidPn)
+    if (changed) {
+      console.log(
+        `[identity] alias-updated instance=${this.runtime.instanceId} lid=${jidLid} pn=${jidPn}`,
+      )
+    }
+  }
+
+  async refreshSessionForJid(jid) {
+    const canonical = await this.resolveCanonicalJid(jid)
+    await this.edgeClient.refreshSession({
+      instanceId: this.runtime.instanceId,
+      jid: canonical,
+      trigger: 'no_matching_sessions',
+    })
+    console.log(
+      `[fallback] reason=session_refreshed instance=${this.runtime.instanceId} jid=${canonical}`,
+    )
   }
 
   async connect() {
@@ -606,18 +764,35 @@ class ConnectionRunner {
         const chatIdNorm = key?.remoteJid
         if (!chatIdNorm) continue
 
+        const lidPnPair = extractLidPnPair(msg)
+        if (lidPnPair?.jid_lid && lidPnPair?.jid_pn) {
+          try {
+            await this.rememberIdentityAlias(lidPnPair.jid_lid, lidPnPair.jid_pn)
+          } catch (error) {
+            console.warn(
+              `[identity] alias-save-failed instance=${instanceId} lid=${lidPnPair.jid_lid} pn=${lidPnPair.jid_pn} error=${normalizeReason(error)}`,
+            )
+          }
+        }
+
         const isGroup = chatIdNorm.endsWith('@g.us')
         const senderJidRaw = isGroup
           ? key.participant || chatIdNorm
           : key.fromMe
             ? this.sock?.user?.id || chatIdNorm
             : chatIdNorm
+        const senderPn = lidPnPair?.jid_pn || null
+        const chatIdCanonical = await this.resolveCanonicalJid(chatIdNorm, senderPn)
+        const senderJidCanonical = await this.resolveCanonicalJid(senderJidRaw, senderPn)
         const contactJid =
-          key.fromMe && senderJidRaw === this.sock?.user?.id ? chatIdNorm : senderJidRaw
+          key.fromMe && senderJidCanonical === this.sock?.user?.id ? chatIdCanonical : senderJidCanonical
 
         console.log('[identity]', {
           chatId: chatIdNorm,
           senderJid: senderJidRaw,
+          senderPn,
+          chatIdCanonical,
+          senderJidCanonical,
           fromMe: !!key.fromMe,
           sockUser: this.sock?.user?.id,
         })
@@ -681,8 +856,9 @@ class ConnectionRunner {
           body,
           wa_message_id: key.id || null,
           from_me: !!key.fromMe,
-          chat_id_norm: chatIdNorm,
-          sender_jid_raw: senderJidRaw,
+          chat_id_norm: chatIdCanonical,
+          sender_jid_raw: senderJidCanonical,
+          sender_pn: senderPn,
           sender_contact_id: senderContactId,
           push_name: pushName,
           media_type: mediaType,
@@ -901,6 +1077,10 @@ class EdgeClient {
 
   async uploadMedia(payload) {
     return this.post('/upload-media', payload)
+  }
+
+  async refreshSession(payload) {
+    return this.post('/sessions/refresh', payload)
   }
 
   async safeUpdateStatus(instanceId, status, qrCode) {
