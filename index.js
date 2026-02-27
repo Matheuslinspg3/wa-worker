@@ -1279,7 +1279,10 @@ class EdgeClient {
       }
 
       try {
-        return rawBody ? JSON.parse(rawBody) : null
+        return {
+          bodyText: rawBody,
+          payload: rawBody ? JSON.parse(rawBody) : null,
+        }
       } catch (error) {
         console.error(`[discovery] eligible-instances invalid JSON body=${rawBody}`)
         throw error
@@ -1654,13 +1657,16 @@ class InstanceManager {
     try {
       const eligibleInstancesEndpoint = '/eligible-instances?enabled=true&limit=50&order=priority.desc'
 
-      const [settings, candidatesPayload] = await Promise.all([
+      const [settings, candidatesResponse] = await Promise.all([
         this.edgeClient.get('/worker-settings').catch((error) => {
           console.error(`[discovery] worker-settings unavailable: ${normalizeReason(error)}`)
           return null
         }),
         this.edgeClient.getEligibleInstances(eligibleInstancesEndpoint),
       ])
+
+      const candidatesPayload = candidatesResponse?.payload
+      const bodyText = candidatesResponse?.bodyText
 
       if (!Array.isArray(candidatesPayload?.instances)) {
         console.error('[discovery] eligible-instances payload missing instances array; skipping cycle')
@@ -1707,6 +1713,10 @@ class InstanceManager {
       this.desiredIds = new Set(targetIds)
 
       console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
+
+      if (targetIds.length === 0) {
+        console.log('[discovery] eligible-instances body=', bodyText)
+      }
 
       for (const runtime of this.runtimes.values()) {
         if (this.desiredIds.has(runtime.instanceId)) {
