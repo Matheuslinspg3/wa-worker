@@ -868,6 +868,7 @@ class ConnectionRunner {
     this.connecting = true
 
     try {
+      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', null)
       const { state, saveCreds } = await useMultiFileAuthState(this.authPath)
       const { version } = await fetchLatestBaileysVersion()
       this.sock = makeWASocket({ auth: state, version })
