@@ -38,6 +38,7 @@ Locks adquiridos são renovados em background (`/instance-lock/renew`) até shut
 - Reconexão com backoff por instância e reset no open.
 - Wipe de auth em sinais de sessão inválida/logged out/stream 515.
 - Circuit breaker para corrupção de sessão Signal (`Bad MAC`/falha de decrypt): ao exceder `BAD_MAC_THRESHOLD` em `BAD_MAC_WINDOW_MS`, marca `DISCONNECTED`, limpa auth local e força novo QR.
+- Reconciliação de identidade PN/LID por instância (`/data/auth/<instanceId>/identity-alias-map.json`) para evitar sessão duplicada para o mesmo usuário.
 
 ### 3) OutboundQueueRunner (por instância conectada)
 
@@ -70,6 +71,7 @@ No `messages.upsert` (`type=notify`) envia para `/inbound`:
 - `chat_id` (obrigatório): `message.key.remoteJid`
 - `chat_type`: `group` quando `chat_id` termina com `@g.us`, senão `direct`
 - `sender_jid_raw` (obrigatório): grupo=`key.participant`, privado=`key.remoteJid`
+- `sender_pn` (opcional): JID canônico de pessoa (`@s.whatsapp.net`) quando disponível
 - `sender_contact_id` (opcional): resolvido via `POST /contacts/resolve` com `{ instanceId, jid, jid_type, push_name }`
 - `push_name` (opcional)
 - `wa_message_id` (opcional)
@@ -83,6 +85,8 @@ Regras:
 - Se não houver `body` **e** não houver mídia, o worker não envia `/inbound`.
 - Para mídia, o arquivo é salvo em `/data/media/<instanceId>/<wa_message_id>.<ext>` e depois enviado ao proxy via `POST /upload-media` (Bearer `WORKER_SECRET`).
 - O worker não loga bytes/base64 de mídia.
+- Para identidade, o worker prioriza `senderPn` (`@s.whatsapp.net`) como canônico e mantém `@lid` como alias persistido por instância.
+- Em erro `No matching sessions found`, o worker faz refresh controlado de sessão/prekey via `POST /sessions/refresh` com backoff e limite (`DECRYPT_RETRY_MAX_ATTEMPTS`), emitindo logs de fallback (`identity_alias_resolved`, `session_refreshed`, `decrypt_retry_exhausted`).
 
 ## Variáveis de ambiente
 
@@ -101,6 +105,7 @@ Regras:
 - `BAD_MAC_WINDOW_MS` (opcional, default `60000`)
 - `BAD_MAC_THRESHOLD` (opcional, default `20`)
 - `BAD_MAC_COOLDOWN_MS` (opcional, default `300000`)
+- `DECRYPT_RETRY_MAX_ATTEMPTS` (opcional, default `2`)
 
 ## Persistência (obrigatória)
 
@@ -125,9 +130,7 @@ Com base no `EDGE_BASE_URL`:
 - `POST /contacts/resolve`
 - `GET /contacts/primary-jid?instanceId=<instanceId>&jid=<jid@lid>`
 - `POST /upload-media` (obrigatório para inbound de mídia)
-- `POST /instance-lock/acquire`
-- `POST /instance-lock/renew`
-- `POST /instance-lock/release`
+- `POST /sessions/refresh` (recomendado para fallback de sessão/prekey)
 
 ### Contrato recomendado para `POST /upload-media` (worker-proxy)
 
