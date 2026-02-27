@@ -109,11 +109,11 @@ process.on('unhandledRejection', (error) => {
 })
 
 process.on('SIGTERM', () => {
-  gracefulShutdown('SIGTERM').then(() => process.exit(0))
+  gracefulShutdown('SIGTERM').then(() => process.exit(0)).catch(() => process.exit(1))
 })
 
 process.on('SIGINT', () => {
-  gracefulShutdown('SIGINT').then(() => process.exit(0))
+  gracefulShutdown('SIGINT').then(() => process.exit(0)).catch(() => process.exit(1))
 })
 
 function authHeaders() {
@@ -662,7 +662,18 @@ class OutboundQueueRunner {
         }
 
         if (!queued?.id || !queued?.to || (!queued?.body && !queued?.media_url)) {
-          console.warn(`[queue:${this.runtime.instanceId}] malformed queued message ignored`)
+          console.warn(`[queue:${this.runtime.instanceId}] malformed queued message id=${queued?.id || 'n/a'}`)
+          if (queued?.id) {
+            try {
+              await this.edgeClient.post('/mark-failed', {
+                messageId: queued.id,
+                error: 'malformed-message',
+                send_debug: { reason: 'missing required fields (to, body, or media_url)' },
+              })
+            } catch (markError) {
+              console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
+            }
+          }
           continue
         }
 
@@ -906,6 +917,14 @@ class ConnectionRunner {
 
   cacheContactResolve(instanceId, jid, data) {
     this.contactResolveCache.set(this.resolveCacheKey(instanceId, jid), data)
+    if (this.contactResolveCache.size > 500) {
+      const now = Date.now()
+      for (const [key, cached] of this.contactResolveCache) {
+        if (cached.expiresAt <= now) {
+          this.contactResolveCache.delete(key)
+        }
+      }
+    }
   }
 
   async resolveSenderContactId({ instanceId, contactJid, pushName }) {
@@ -1069,19 +1088,26 @@ class ConnectionRunner {
         }
 
         try {
-          const res = await fetch(`${EDGE_BASE_URL}/inbound`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${WORKER_SECRET}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload),
-          })
-          const txt = await res.text()
-          if (!res.ok) {
-            console.error(`[inbound] FAIL instance=${instanceId} status=${res.status} body=${txt}`)
-          } else {
-            console.log(`[inbound] ok instance=${instanceId} chat=${chatIdNorm}`)
+          const inboundController = new AbortController()
+          const inboundTimeout = setTimeout(() => inboundController.abort(), HTTP_TIMEOUT_MS)
+          try {
+            const res = await fetch(`${EDGE_BASE_URL}/inbound`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${WORKER_SECRET}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payload),
+              signal: inboundController.signal,
+            })
+            const txt = await res.text()
+            if (!res.ok) {
+              console.error(`[inbound] FAIL instance=${instanceId} status=${res.status} body=${txt}`)
+            } else {
+              console.log(`[inbound] ok instance=${instanceId} chat=${chatIdNorm}`)
+            }
+          } finally {
+            clearTimeout(inboundTimeout)
           }
         } catch (error) {
           this.registerSignalSessionError(error, 'inbound-delivery')
@@ -1687,6 +1713,8 @@ class InstanceManager {
       const targetInstances = maxActiveInstances > 0 ? ordered.slice(0, maxActiveInstances) : []
       const targetIds = targetInstances.map((instance) => String(instance.id))
 
+      this.desiredIds = new Set(targetIds)
+
       for (const instance of targetInstances) {
         const candidate = String(instance.id)
 
@@ -1705,8 +1733,6 @@ class InstanceManager {
           console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
         }
       }
-
-      this.desiredIds = new Set(targetIds)
 
       console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
 
