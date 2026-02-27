@@ -209,6 +209,10 @@ function normalizeReason(error) {
   return error.message || 'unknown'
 }
 
+function isHttpStatusError(error, statusCode) {
+  return Number(error?.statusCode || error?.status || 0) === Number(statusCode)
+}
+
 function numberOrFallback(value, fallback) {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
@@ -864,6 +868,7 @@ class ConnectionRunner {
     this.connecting = true
 
     try {
+      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', null)
       const { state, saveCreds } = await useMultiFileAuthState(this.authPath)
       const { version } = await fetchLatestBaileysVersion()
       this.sock = makeWASocket({ auth: state, version })
@@ -1336,11 +1341,20 @@ class InstanceLockCoordinator {
   }
 
   async acquire(instanceId) {
-    const response = await this.edgeClient.acquireInstanceLock({
-      instanceId,
-      instanceOwner: PROCESS_OWNER_ID,
-      ttlMs: LOCK_TTL_MS,
-    })
+    let response
+    try {
+      response = await this.edgeClient.acquireInstanceLock({
+        instanceId,
+        instanceOwner: PROCESS_OWNER_ID,
+        ttlMs: LOCK_TTL_MS,
+      })
+    } catch (error) {
+      if (isHttpStatusError(error, 404)) {
+        console.warn(`[lock_skip] instance=${instanceId} reason=not_found`)
+        return false
+      }
+      throw error
+    }
 
     const { acquired, owner, lockToken } = parseLockPayload(response)
     if (!acquired) {
@@ -1613,7 +1627,38 @@ class InstanceManager {
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
-      let targetIds = ordered.slice(0, maxActiveInstances).map((item) => String(item.id))
+      const targetIds = []
+
+      if (maxActiveInstances > 0) {
+        for (const instance of ordered) {
+          if (targetIds.length >= maxActiveInstances) {
+            break
+          }
+
+          const candidate = String(instance.id)
+
+          try {
+            const started = await this.ensureRunning(candidate)
+            const runtime = this.runtimes.get(candidate)
+
+            if (runtime) {
+              runtime.priority = numberOrFallback(instance.priority, 0)
+            }
+
+            const isActive = Boolean(runtime && (runtime.isBusy() || runtime.sock || runtime.isConnected()))
+
+            if (started) {
+              startedIds.push(candidate)
+            }
+
+            if (started || isActive) {
+              targetIds.push(candidate)
+            }
+          } catch (error) {
+            console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
+          }
+        }
+      }
 
       if (targetIds.length === 0 && maxActiveInstances > 0 && this.runtimes.size > 0) {
         const runtimeFallback = [...this.runtimes.values()]
@@ -1623,30 +1668,13 @@ class InstanceManager {
 
         if (runtimeFallback.length > 0) {
           console.warn('[discovery] eligible-instances returned empty, preserving current runtimes as fallback targets')
-          targetIds = runtimeFallback
+          targetIds.push(...runtimeFallback)
         }
       }
 
       this.desiredIds = new Set(targetIds)
 
       console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
-
-      for (const candidate of targetIds) {
-        const runtime = this.getOrCreateRuntime(candidate)
-        runtime.priority = numberOrFallback(
-          ordered.find((item) => String(item.id) === candidate)?.priority,
-          0,
-        )
-
-        try {
-          const started = await this.ensureRunning(candidate)
-          if (started) {
-            startedIds.push(candidate)
-          }
-        } catch (error) {
-          console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
-        }
-      }
 
       for (const runtime of this.runtimes.values()) {
         if (this.desiredIds.has(runtime.instanceId)) {
