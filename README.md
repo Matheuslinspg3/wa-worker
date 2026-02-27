@@ -49,8 +49,8 @@ Normalização de destino outbound:
 
 - número puro `5511999999999` → `5511999999999@s.whatsapp.net`
 - id de grupo `1203630...-1234567890` → `...@g.us`
-- `@lid` → resolve via `GET /resolve-lid?instanceId=...&jid=...`; se retornar `jid_pn`, usa `jid_pn` como destino
-- `@lid` sem resolução (`jid_pn`) → falha com `mark-failed` (`invalid-destination:lid`)
+- `@lid` → resolve via `GET /contacts/primary-jid?instanceId=...&jid=...`; se retornar PN (`jid_pn`/`jid`), usa como destino
+- `@lid` sem resolução → falha com `mark-failed` (`lid_without_mapping`, incluindo `send_debug`)
 
 > Nunca envia outbound se a instância não estiver `CONNECTED`.
 
@@ -64,7 +64,8 @@ No `messages.upsert` (`type=notify`) envia para `/inbound`:
 - `body` (obrigatório; pode ser `""` se houver mídia)
 - `chat_id` (obrigatório): `message.key.remoteJid`
 - `chat_type`: `group` quando `chat_id` termina com `@g.us`, senão `direct`
-- `sender_id` (obrigatório): grupo=`key.participant`, privado=`key.remoteJid`
+- `sender_jid_raw` (obrigatório): grupo=`key.participant`, privado=`key.remoteJid`
+- `sender_contact_id` (opcional): resolvido via `POST /contacts/resolve` com `{ instanceId, jid, jid_type, push_name }`
 - `push_name` (opcional)
 - `wa_message_id` (opcional)
 - `timestamp` (opcional)
@@ -114,8 +115,8 @@ Com base no `EDGE_BASE_URL`:
 - `POST /mark-sent`
 - `POST /mark-failed` (opcional, recomendado)
 - `POST /inbound`
-- `POST /upsert-contact` (quando detectar par `jid_lid` + `jid_pn` no inbound)
-- `GET /resolve-lid?instanceId=<instanceId>&jid=<jid@lid>`
+- `POST /contacts/resolve`
+- `GET /contacts/primary-jid?instanceId=<instanceId>&jid=<jid@lid>`
 - `POST /upload-media` (obrigatório para inbound de mídia)
 
 ### Contrato recomendado para `POST /upload-media` (worker-proxy)
