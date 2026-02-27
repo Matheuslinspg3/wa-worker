@@ -4,6 +4,7 @@ const path = require('path')
 const {
   default: makeWASocket,
   DisconnectReason,
+  downloadContentFromMessage,
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } = require('@whiskeysockets/baileys')
@@ -15,6 +16,7 @@ const PORT = Number(process.env.PORT) || 3000
 const DISCOVERY_POLL_MS = Number(process.env.DISCOVERY_POLL_MS) || 10_000
 const QUEUE_POLL_MS = Number(process.env.QUEUE_POLL_MS) || 2_000
 const AUTH_BASE = process.env.AUTH_BASE || '/data/auth'
+const MEDIA_BASE = process.env.MEDIA_BASE || '/data/media'
 
 const HTTP_TIMEOUT_MS = 10_000
 const KEEP_ALIVE_MS = 60_000
@@ -107,15 +109,50 @@ function parseStatusCode(error) {
   )
 }
 
-function extractBody(message) {
-  return (
-    message?.message?.conversation ||
-    message?.message?.extendedTextMessage?.text ||
-    message?.message?.imageMessage?.caption ||
-    message?.message?.videoMessage?.caption ||
-    message?.message?.documentMessage?.caption ||
-    ''
-  )
+function extractInboundContent(message) {
+  const messageNode = message?.message || {}
+
+  if (messageNode?.conversation || messageNode?.extendedTextMessage?.text) {
+    return {
+      mediaType: null,
+      body: (messageNode?.conversation || messageNode?.extendedTextMessage?.text || '').trim(),
+      content: null,
+    }
+  }
+
+  if (messageNode?.imageMessage) {
+    return {
+      mediaType: 'image',
+      body: messageNode.imageMessage.caption || '',
+      content: messageNode.imageMessage,
+    }
+  }
+
+  if (messageNode?.videoMessage) {
+    return {
+      mediaType: 'video',
+      body: messageNode.videoMessage.caption || '',
+      content: messageNode.videoMessage,
+    }
+  }
+
+  if (messageNode?.audioMessage) {
+    return {
+      mediaType: 'audio',
+      body: '',
+      content: messageNode.audioMessage,
+    }
+  }
+
+  if (messageNode?.documentMessage) {
+    return {
+      mediaType: 'document',
+      body: messageNode.documentMessage.caption || '',
+      content: messageNode.documentMessage,
+    }
+  }
+
+  return { mediaType: null, body: '', content: null }
 }
 
 function resolvePushName(upsert, message) {
@@ -124,6 +161,60 @@ function resolvePushName(upsert, message) {
 
 function normalizeDigits(value) {
   return String(value || '').replace(/\D/g, '')
+}
+
+function sanitizeFileName(name) {
+  return String(name || '')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .slice(0, 120)
+}
+
+function numberFromUnknown(value) {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : null
+}
+
+function inferExtension({ mimeType, fileName, mediaType }) {
+  const extByMime = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'video/mp4': 'mp4',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'application/pdf': 'pdf',
+  }
+
+  if (mimeType && extByMime[mimeType]) {
+    return extByMime[mimeType]
+  }
+
+  const fileExt = path.extname(fileName || '').replace('.', '').trim().toLowerCase()
+  if (fileExt) {
+    return fileExt
+  }
+
+  return mediaType === 'image'
+    ? 'jpg'
+    : mediaType === 'video'
+      ? 'mp4'
+      : mediaType === 'audio'
+        ? 'ogg'
+        : 'bin'
+}
+
+async function streamToBuffer(stream) {
+  const chunks = []
+  for await (const chunk of stream) {
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+async function downloadInboundMedia(content, mediaType) {
+  const stream = await downloadContentFromMessage(content, mediaType)
+  return streamToBuffer(stream)
 }
 
 function normalizeOutboundTo(message) {
@@ -156,6 +247,10 @@ function normalizeOutboundTo(message) {
   const digits = normalizeDigits(originalTo)
   if (digits && digits === originalTo) {
     return { originalTo, toNormalized: `${digits}@s.whatsapp.net` }
+  }
+
+  if (/^\d+-\d+$/.test(originalTo)) {
+    return { originalTo, toNormalized: `${originalTo}@g.us` }
   }
 
   return { originalTo, toNormalized: originalTo }
@@ -231,7 +326,7 @@ class OutboundQueueRunner {
           break
         }
 
-        if (!queued?.id || !queued?.to || !queued?.body) {
+        if (!queued?.id || !queued?.to || (!queued?.body && !queued?.media_url)) {
           console.warn(`[queue:${this.runtime.instanceId}] malformed queued message ignored`)
           continue
         }
@@ -255,7 +350,7 @@ class OutboundQueueRunner {
         }
 
         try {
-          const sent = await this.runtime.sock.sendMessage(toNormalized, { text: queued.body })
+          const sent = await this.sendOutboundMessage(toNormalized, queued)
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
             wa_message_id: sent?.key?.id || null,
@@ -278,6 +373,54 @@ class OutboundQueueRunner {
     } finally {
       this.processing = false
     }
+  }
+
+  async fetchMediaBuffer(url) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS)
+
+    try {
+      const response = await fetch(url, { signal: controller.signal })
+      if (!response.ok) {
+        throw new Error(`media-download-http-${response.status}`)
+      }
+      return Buffer.from(await response.arrayBuffer())
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  async sendOutboundMessage(toNormalized, queued) {
+    if (!queued?.media_url) {
+      return this.runtime.sock.sendMessage(toNormalized, { text: queued.body || '' })
+    }
+
+    const mediaType = queued.media_type || 'document'
+    const mediaBuffer = await this.fetchMediaBuffer(queued.media_url)
+    const caption = queued.body || ''
+
+    if (mediaType === 'image') {
+      return this.runtime.sock.sendMessage(toNormalized, { image: mediaBuffer, caption })
+    }
+
+    if (mediaType === 'video') {
+      return this.runtime.sock.sendMessage(toNormalized, { video: mediaBuffer, caption })
+    }
+
+    if (mediaType === 'audio') {
+      return this.runtime.sock.sendMessage(toNormalized, {
+        audio: mediaBuffer,
+        mimetype: queued.mime_type || 'audio/ogg',
+        ptt: false,
+      })
+    }
+
+    return this.runtime.sock.sendMessage(toNormalized, {
+      document: mediaBuffer,
+      mimetype: queued.mime_type || 'application/octet-stream',
+      fileName: queued.file_name || `document-${queued.id}`,
+      caption,
+    })
   }
 }
 
@@ -349,27 +492,95 @@ class ConnectionRunner {
       }
 
       for (const message of messages) {
+        if (message?.key?.fromMe) {
+          continue
+        }
+
         const chatIdRaw = message?.key?.remoteJid || null
         const participantRaw =
           message?.key?.participant || message?.participantPn || message?.participantLid || null
         const senderId = participantRaw || chatIdRaw
         const toId = this.sock?.user?.id || null
-        const body = extractBody(message).trim()
-        if (!body) {
+        const chatType = chatIdRaw?.endsWith('@g.us') ? 'group' : 'direct'
+        const inbound = extractInboundContent(message)
+        const body = inbound.body || ''
+        const hasMedia = Boolean(inbound.mediaType)
+
+        if (!body && !hasMedia) {
           continue
         }
         const pushName = resolvePushName(upsert, message)
+
+        let mediaUrl = null
+        let mimeType = inbound.content?.mimetype || null
+        let fileName = inbound.content?.fileName || null
+        let fileSize = numberFromUnknown(inbound.content?.fileLength)
+
+        if (hasMedia) {
+          try {
+            const waMessageId = message?.key?.id || `${Date.now()}`
+            const ext = inferExtension({
+              mimeType,
+              fileName,
+              mediaType: inbound.mediaType,
+            })
+            const instancePath = path.join(MEDIA_BASE, this.runtime.instanceId)
+            await fs.mkdir(instancePath, { recursive: true })
+            const safeName = sanitizeFileName(`${waMessageId}.${ext}`)
+            const mediaPath = path.join(instancePath, safeName)
+            const mediaBuffer = await downloadInboundMedia(inbound.content, inbound.mediaType)
+            await fs.writeFile(mediaPath, mediaBuffer)
+
+            const uploadPayload = {
+              instanceId: this.runtime.instanceId,
+              messageId: waMessageId,
+              mime_type: mimeType,
+              file_name: fileName || safeName,
+              bytes_base64: mediaBuffer.toString('base64'),
+            }
+
+            const uploadResponse = await this.edgeClient.post('/upload-media', uploadPayload)
+            mediaUrl = uploadResponse?.media_url || null
+
+            if (!mediaUrl) {
+              console.warn(
+                `[inbound:${this.runtime.instanceId}] upload-media missing media_url message=${waMessageId}`,
+              )
+            }
+          } catch (error) {
+            console.error(
+              `[inbound:${this.runtime.instanceId}] media processing failed message=${message?.key?.id || 'n/a'} reason=${normalizeReason(error)}`,
+            )
+            continue
+          }
+        }
 
         const payload = {
           instanceId: this.runtime.instanceId,
           from: senderId,
           to: toId,
           body,
+          chat_id: chatIdRaw,
+          chat_type: chatType,
+          sender_id: senderId,
           push_name: pushName,
           wa_message_id: message?.key?.id || null,
+          timestamp: numberFromUnknown(message?.messageTimestamp),
         }
 
-        if (!payload.from || !payload.to || !payload.body || !payload.wa_message_id) {
+        if (hasMedia) {
+          payload.media_type = inbound.mediaType
+          payload.media_url = mediaUrl
+          payload.mime_type = mimeType
+          payload.file_name = fileName
+          payload.file_size = fileSize
+        }
+
+        if (!payload.from || !payload.to || !payload.instanceId || !payload.chat_id || !payload.sender_id) {
+          continue
+        }
+
+        if (!payload.body && !payload.media_url) {
           continue
         }
 
