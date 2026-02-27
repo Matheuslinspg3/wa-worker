@@ -82,7 +82,10 @@ async function requestJson(method, endpoint, body) {
 
     if (!response.ok) {
       const details = await safeReadBody(response)
-      throw new Error(`HTTP ${response.status}${details ? `: ${details.slice(0, 220)}` : ''}`)
+      const error = new Error(`HTTP ${response.status}${details ? `: ${details.slice(0, 220)}` : ''}`)
+      error.statusCode = response.status
+      error.responseBody = details
+      throw error
     }
 
     if (response.status === 204) {
@@ -93,6 +96,48 @@ async function requestJson(method, endpoint, body) {
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function isContactResolveConflict(error) {
+  const statusCode = Number(error?.statusCode || error?.status || 0)
+  const rawBody = typeof error?.responseBody === 'string' ? error.responseBody : ''
+  const normalizedBody = rawBody.toLowerCase()
+
+  if (statusCode === 409) {
+    return true
+  }
+
+  if (statusCode === 500) {
+    return (
+      normalizedBody.includes('contacts_instance_id_jid_key') ||
+      normalizedBody.includes('duplicate key value') ||
+      normalizedBody.includes('23505')
+    )
+  }
+
+  return false
+}
+
+function resolveContactOperation(result) {
+  const op = String(result?.operation || result?.outcome || result?.status || '').toLowerCase()
+
+  if (['created', 'updated', 'already_exists'].includes(op)) {
+    return op
+  }
+
+  return 'created'
+}
+
+function logContactResolve(instanceId, jid, operation, extra = {}) {
+  console.log(
+    JSON.stringify({
+      event: 'contact_resolve',
+      instanceId,
+      jid,
+      operation,
+      ...extra,
+    }),
+  )
 }
 
 function normalizeReason(error) {
@@ -630,12 +675,20 @@ class ConnectionRunner {
             jid: contactJid,
             jid_type: resolveJidType(contactJid),
             push_name: pushName,
+            write_mode: 'upsert',
           })
           senderContactId = resolved?.contact_id || resolved?.id || null
+          logContactResolve(instanceId, contactJid, resolveContactOperation(resolved), {
+            contactId: senderContactId,
+          })
         } catch (error) {
-          console.warn(
-            `[contact-resolve:${instanceId}] failed jid=${contactJid} error=${normalizeReason(error)}`,
-          )
+          if (isContactResolveConflict(error)) {
+            logContactResolve(instanceId, contactJid, 'already_exists')
+          } else {
+            console.warn(
+              `[contact-resolve:${instanceId}] failed jid=${contactJid} error=${normalizeReason(error)}`,
+            )
+          }
         }
 
         const { mediaType, body, content } = extractInboundContent(msg)
