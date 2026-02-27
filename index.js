@@ -1627,7 +1627,38 @@ class InstanceManager {
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
-      let targetIds = ordered.slice(0, maxActiveInstances).map((item) => String(item.id))
+      const targetIds = []
+
+      if (maxActiveInstances > 0) {
+        for (const instance of ordered) {
+          if (targetIds.length >= maxActiveInstances) {
+            break
+          }
+
+          const candidate = String(instance.id)
+
+          try {
+            const started = await this.ensureRunning(candidate)
+            const runtime = this.runtimes.get(candidate)
+
+            if (runtime) {
+              runtime.priority = numberOrFallback(instance.priority, 0)
+            }
+
+            const isActive = Boolean(runtime && (runtime.isBusy() || runtime.sock || runtime.isConnected()))
+
+            if (started) {
+              startedIds.push(candidate)
+            }
+
+            if (started || isActive) {
+              targetIds.push(candidate)
+            }
+          } catch (error) {
+            console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
+          }
+        }
+      }
 
       if (targetIds.length === 0 && maxActiveInstances > 0 && this.runtimes.size > 0) {
         const runtimeFallback = [...this.runtimes.values()]
@@ -1637,30 +1668,13 @@ class InstanceManager {
 
         if (runtimeFallback.length > 0) {
           console.warn('[discovery] eligible-instances returned empty, preserving current runtimes as fallback targets')
-          targetIds = runtimeFallback
+          targetIds.push(...runtimeFallback)
         }
       }
 
       this.desiredIds = new Set(targetIds)
 
       console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
-
-      for (const candidate of targetIds) {
-        const runtime = this.getOrCreateRuntime(candidate)
-        runtime.priority = numberOrFallback(
-          ordered.find((item) => String(item.id) === candidate)?.priority,
-          0,
-        )
-
-        try {
-          const started = await this.ensureRunning(candidate)
-          if (started) {
-            startedIds.push(candidate)
-          }
-        } catch (error) {
-          console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
-        }
-      }
 
       for (const runtime of this.runtimes.values()) {
         if (this.desiredIds.has(runtime.instanceId)) {
