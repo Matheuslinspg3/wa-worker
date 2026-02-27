@@ -360,11 +360,20 @@ class OutboundQueueRunner {
         }
 
         try {
-          const sent = await this.sendOutboundMessage(toNormalized, queued)
+          const result = await this.sendOutboundMessage(toNormalized, queued)
+          console.log('[send-result]', JSON.stringify(result))
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
-            wa_message_id: sent?.key?.id || null,
+            wa_message_id: result?.key?.id || null,
+            send_debug: {
+              toOriginal: originalTo,
+              toNormalized,
+              result,
+            },
           })
+          console.log(
+            `[send-success] messageId=${queued.id} toOriginal=${originalTo} toNormalized=${toNormalized} wa_message_id=${result?.key?.id || null}`,
+          )
           console.log('[mark-sent] ok')
         } catch (error) {
           const reason = normalizeReason(error)
@@ -373,11 +382,20 @@ class OutboundQueueRunner {
             await this.edgeClient.post('/mark-failed', {
               messageId: queued.id,
               error: reason,
+              send_debug: {
+                toOriginal: originalTo,
+                toNormalized,
+                error: error?.message || String(error),
+                stack: error?.stack || null,
+              },
             })
           } catch (markError) {
             markStatus = normalizeReason(markError)
             console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
           }
+          console.error(
+            `[send-failed] messageId=${queued.id} toOriginal=${originalTo} toNormalized=${toNormalized} error=${reason}`,
+          )
           console.log(`[mark-failed] ok status=${markStatus}`)
           console.error(
             `[queue:${this.runtime.instanceId}] send failed for ${queued.id}: ${reason} toOriginal=${originalTo} toNormalized=${toNormalized}`,
