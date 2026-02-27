@@ -10,7 +10,20 @@ const {
 } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 
-const EDGE_BASE_URL = process.env.EDGE_BASE_URL
+function normalizeEdgeBaseUrl(value) {
+  const trimmed = String(value || '').trim().replace(/\/+$/, '')
+  if (!trimmed) {
+    return ''
+  }
+
+  if (trimmed.endsWith('/inbound')) {
+    return trimmed.slice(0, -'/inbound'.length)
+  }
+
+  return trimmed
+}
+
+const EDGE_BASE_URL = normalizeEdgeBaseUrl(process.env.EDGE_BASE_URL)
 const WORKER_SECRET = process.env.WORKER_SECRET
 const PORT = Number(process.env.PORT) || 3000
 const DISCOVERY_POLL_MS = Number(process.env.DISCOVERY_POLL_MS) || 10_000
@@ -486,118 +499,67 @@ class ConnectionRunner {
     this.sock.ev.on('creds.update', saveCreds)
 
     this.sock.ev.on('messages.upsert', async (upsert) => {
-      const { messages, type } = upsert
-      if (type !== 'notify') {
-        return
-      }
+      const instanceId = this.runtime.instanceId
+      console.log(`[upsert] instance=${instanceId} type=${upsert?.type} count=${upsert?.messages?.length || 0}`)
+      if (!upsert?.messages?.length) return
 
-      for (const msg of messages) {
-        if (msg?.key?.fromMe) {
-          continue
-        }
+      if (upsert.type && upsert.type !== 'notify' && upsert.type !== 'append') return
 
-        const chatId = msg?.key?.remoteJid || null
-        const isGroup = Boolean(chatId && chatId.endsWith('@g.us'))
-        const senderId = isGroup ? msg?.key?.participant || null : chatId
-        const toId = this.sock?.user?.id || null
-        const inbound = extractInboundContent(msg)
-        const body = inbound.body || ''
-        const hasMedia = Boolean(inbound.mediaType)
+      for (const msg of upsert.messages) {
+        if (!msg) continue
 
-        if (!body && !hasMedia) {
-          continue
-        }
-        const pushName = resolvePushName(upsert, msg)
+        const key = msg.key
+        const chatId = key?.remoteJid
+        if (!chatId) continue
 
-        let mediaUrl = null
-        let mimeType = inbound.content?.mimetype || null
-        let fileName = inbound.content?.fileName || null
-        let fileSize = numberFromUnknown(inbound.content?.fileLength)
+        const isGroup = chatId.endsWith('@g.us')
+        const senderId = isGroup ? key.participant || chatId : chatId
 
-        if (hasMedia) {
-          try {
-            const waMessageId = msg?.key?.id || `${Date.now()}`
-            const ext = inferExtension({
-              mimeType,
-              fileName,
-              mediaType: inbound.mediaType,
-            })
-            const instancePath = path.join(MEDIA_BASE, this.runtime.instanceId)
-            await fs.mkdir(instancePath, { recursive: true })
-            const safeName = sanitizeFileName(`${waMessageId}.${ext}`)
-            const mediaPath = path.join(instancePath, safeName)
-            const mediaBuffer = await downloadInboundMedia(inbound.content, inbound.mediaType)
-            await fs.writeFile(mediaPath, mediaBuffer)
+        const m = msg.message || {}
+        const body =
+          m.conversation ||
+          m.extendedTextMessage?.text ||
+          m.imageMessage?.caption ||
+          m.videoMessage?.caption ||
+          ''
 
-            const uploadPayload = {
-              instanceId: this.runtime.instanceId,
-              messageId: waMessageId,
-              mime_type: mimeType,
-              file_name: fileName || safeName,
-              bytes_base64: mediaBuffer.toString('base64'),
-            }
-
-            const uploadResponse = await this.edgeClient.post('/upload-media', uploadPayload)
-            mediaUrl = uploadResponse?.media_url || null
-
-            if (!mediaUrl) {
-              console.warn(
-                `[inbound:${this.runtime.instanceId}] upload-media missing media_url message=${waMessageId}`,
-              )
-            }
-          } catch (error) {
-            console.error(
-              `[inbound:${this.runtime.instanceId}] media processing failed message=${msg?.key?.id || 'n/a'} reason=${normalizeReason(error)}`,
-            )
-            continue
-          }
-        }
+        if (!body) continue
 
         const payload = {
-          instanceId: this.runtime.instanceId,
+          instanceId,
           from: senderId,
-          to: toId,
+          to: this.sock?.user?.id || '',
           body,
+          wa_message_id: key.id || null,
+          from_me: !!key.fromMe,
           chat_id_norm: chatId,
           sender_id: senderId,
-          from_me: Boolean(msg?.key?.fromMe),
-          push_name: pushName,
-          wa_message_id: msg?.key?.id || null,
-          timestamp: numberFromUnknown(msg?.messageTimestamp),
-        }
-
-        if (hasMedia) {
-          payload.media_type = inbound.mediaType
-          payload.media_url = mediaUrl
-          payload.mime_type = mimeType
-          payload.file_name = fileName
-          payload.file_size = fileSize
-        }
-
-        if (!payload.from || !payload.to || !payload.instanceId || !payload.chat_id_norm || !payload.sender_id) {
-          continue
-        }
-
-        if (!payload.body && !payload.media_url) {
-          continue
-        }
-
-        if (payload.push_name) {
-          console.log(`[inbound] instance=${this.runtime.instanceId} chat=${chatId} isGroup=${isGroup} sender=${senderId} push=${payload.push_name}`)
-        } else {
-          console.log(`[inbound] instance=${this.runtime.instanceId} chat=${chatId} isGroup=${isGroup} sender=${senderId} push=`)
+          push_name: upsert.pushName || msg.pushName || null,
         }
 
         try {
-          await this.edgeClient.post('/inbound', payload)
+          const res = await fetch(`${EDGE_BASE_URL}/inbound`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${WORKER_SECRET}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+          })
+          const txt = await res.text()
+          if (!res.ok) {
+            console.error(`[inbound] FAIL instance=${instanceId} status=${res.status} body=${txt}`)
+          } else {
+            console.log(`[inbound] ok instance=${instanceId} chat=${chatId}`)
+          }
         } catch (error) {
           this.registerSignalSessionError(error, 'inbound-delivery')
-          console.error(
-            `[inbound:${this.runtime.instanceId}] failed to deliver ${payload.wa_message_id}: ${normalizeReason(error)}`,
-          )
+          console.error(`[inbound] ERROR instance=${instanceId}`, error)
         }
       }
     })
+
+    console.log(`[sock] handlers bound instance=${this.runtime.instanceId}`)
 
     this.sock.ev.on('connection.update', async (update) => {
       if (update.qr) {
