@@ -5,6 +5,7 @@ Worker de WhatsApp (Baileys) com suporte a **multi-instância robusta**, persist
 ## O que este worker faz
 
 - Mantém até `N` instâncias ativas (`max_active_instances`) com priorização estável por `priority`.
+- Aplica trava distribuída por `instance_id` com renovação de TTL para evitar bootstrap duplicado entre processos.
 - Evita thrash de scheduler (não recria socket já ativo e só para fora do target com cooldown de 60s).
 - Faz reconexão com backoff por instância (`2s,5s,10s,20s,40s,60s`).
 - Processa outbound com marcação confiável (`mark-sent` / `mark-failed`).
@@ -22,6 +23,10 @@ A cada `DISCOVERY_POLL_MS`:
 3. Calcula `targetIds = TOP N` por prioridade (ordem estável para empates).
 4. Chama `ensureRunning(id)` para cada `targetId`.
 5. Chama `stopGracefully(id)` somente para runtime fora do target (com cooldown de 60s quando conectado).
+
+Antes de iniciar conexão/handlers, o worker tenta adquirir lock distribuído (`/instance-lock/acquire`).
+Se houver conflito (`lock_conflict`), a instância não inicia neste processo.
+Locks adquiridos são renovados em background (`/instance-lock/renew`) até shutdown.
 
 ### 2) ConnectionRunner (por instância)
 
@@ -92,6 +97,8 @@ Regras:
 - `PORT` (opcional, default `3000`)
 - `DISCOVERY_POLL_MS` (opcional, default `10000`)
 - `QUEUE_POLL_MS` (opcional, default `2000`)
+- `INSTANCE_LOCK_TTL_MS` (opcional, default `30000`)
+- `INSTANCE_LOCK_RENEW_MS` (opcional, default `INSTANCE_LOCK_TTL_MS/2`, mínimo `2000`)
 - `AUTH_BASE` (opcional, default `/data/auth`)
 - `MEDIA_BASE` (opcional, default `/data/media`)
 - `MAX_ACTIVE_INSTANCES` (fallback opcional se backend não retornar setting)
