@@ -491,25 +491,23 @@ class ConnectionRunner {
         return
       }
 
-      for (const message of messages) {
-        if (message?.key?.fromMe) {
+      for (const msg of messages) {
+        if (msg?.key?.fromMe) {
           continue
         }
 
-        const chatIdRaw = message?.key?.remoteJid || null
-        const participantRaw =
-          message?.key?.participant || message?.participantPn || message?.participantLid || null
-        const senderId = participantRaw || chatIdRaw
+        const chatId = msg?.key?.remoteJid || null
+        const isGroup = Boolean(chatId && chatId.endsWith('@g.us'))
+        const senderId = isGroup ? msg?.key?.participant || null : chatId
         const toId = this.sock?.user?.id || null
-        const chatType = chatIdRaw?.endsWith('@g.us') ? 'group' : 'direct'
-        const inbound = extractInboundContent(message)
+        const inbound = extractInboundContent(msg)
         const body = inbound.body || ''
         const hasMedia = Boolean(inbound.mediaType)
 
         if (!body && !hasMedia) {
           continue
         }
-        const pushName = resolvePushName(upsert, message)
+        const pushName = resolvePushName(upsert, msg)
 
         let mediaUrl = null
         let mimeType = inbound.content?.mimetype || null
@@ -518,7 +516,7 @@ class ConnectionRunner {
 
         if (hasMedia) {
           try {
-            const waMessageId = message?.key?.id || `${Date.now()}`
+            const waMessageId = msg?.key?.id || `${Date.now()}`
             const ext = inferExtension({
               mimeType,
               fileName,
@@ -549,7 +547,7 @@ class ConnectionRunner {
             }
           } catch (error) {
             console.error(
-              `[inbound:${this.runtime.instanceId}] media processing failed message=${message?.key?.id || 'n/a'} reason=${normalizeReason(error)}`,
+              `[inbound:${this.runtime.instanceId}] media processing failed message=${msg?.key?.id || 'n/a'} reason=${normalizeReason(error)}`,
             )
             continue
           }
@@ -560,12 +558,12 @@ class ConnectionRunner {
           from: senderId,
           to: toId,
           body,
-          chat_id: chatIdRaw,
-          chat_type: chatType,
+          chat_id_norm: chatId,
           sender_id: senderId,
+          from_me: Boolean(msg?.key?.fromMe),
           push_name: pushName,
-          wa_message_id: message?.key?.id || null,
-          timestamp: numberFromUnknown(message?.messageTimestamp),
+          wa_message_id: msg?.key?.id || null,
+          timestamp: numberFromUnknown(msg?.messageTimestamp),
         }
 
         if (hasMedia) {
@@ -576,7 +574,7 @@ class ConnectionRunner {
           payload.file_size = fileSize
         }
 
-        if (!payload.from || !payload.to || !payload.instanceId || !payload.chat_id || !payload.sender_id) {
+        if (!payload.from || !payload.to || !payload.instanceId || !payload.chat_id_norm || !payload.sender_id) {
           continue
         }
 
@@ -585,9 +583,9 @@ class ConnectionRunner {
         }
 
         if (payload.push_name) {
-          console.log(
-            `[inbound] instance=${this.runtime.instanceId} from=${payload.from} push_name=${payload.push_name}`,
-          )
+          console.log(`[inbound] instance=${this.runtime.instanceId} chat=${chatId} isGroup=${isGroup} sender=${senderId} push=${payload.push_name}`)
+        } else {
+          console.log(`[inbound] instance=${this.runtime.instanceId} chat=${chatId} isGroup=${isGroup} sender=${senderId} push=`)
         }
 
         try {
