@@ -35,6 +35,11 @@ const HTTP_TIMEOUT_MS = 10_000
 const KEEP_ALIVE_MS = 60_000
 const STOP_COOLDOWN_MS = 60_000
 const RECONNECT_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000]
+const LOCK_TTL_MS = Math.max(5_000, Number(process.env.INSTANCE_LOCK_TTL_MS) || 30_000)
+const LOCK_RENEW_INTERVAL_MS = Math.max(
+  2_000,
+  Math.min(LOCK_TTL_MS - 1_000, Number(process.env.INSTANCE_LOCK_RENEW_MS) || Math.floor(LOCK_TTL_MS / 2)),
+)
 const FALLBACK_MAX_ACTIVE_INSTANCES = Math.max(
   0,
   Number(process.env.MAX_ACTIVE_INSTANCES) || 0,
@@ -49,12 +54,56 @@ const SIGNAL_SESSION_ERROR_SNIPPETS = [
   'no matching sessions found',
 ]
 
+const PROCESS_OWNER_ID = `${process.env.INSTANCE_OWNER_PREFIX || process.env.HOSTNAME || 'worker'}:${process.pid}`
+
+let instanceManager = null
+let shutdownPromise = null
+
+async function gracefulShutdown(signal, { fatalError = null } = {}) {
+  if (shutdownPromise) {
+    return shutdownPromise
+  }
+
+  shutdownPromise = (async () => {
+    console.log(`[shutdown] signal=${signal} owner=${PROCESS_OWNER_ID}`)
+
+    if (instanceManager) {
+      await instanceManager.shutdown({ signal, fatalError })
+    }
+
+    if (fatalError) {
+      console.error('[shutdown] fatal error', fatalError)
+      process.exit(1)
+    }
+  })().finally(() => {
+    shutdownPromise = null
+  })
+
+  return shutdownPromise
+}
+
 process.on('uncaughtException', (error) => {
   console.error('[fatal] uncaughtException', error)
+  gracefulShutdown('uncaughtException', { fatalError: error }).catch((shutdownError) => {
+    console.error('[shutdown] uncaughtException cleanup failed', shutdownError)
+    process.exit(1)
+  })
 })
 
 process.on('unhandledRejection', (error) => {
   console.error('[fatal] unhandledRejection', error)
+  gracefulShutdown('unhandledRejection', { fatalError: error }).catch((shutdownError) => {
+    console.error('[shutdown] unhandledRejection cleanup failed', shutdownError)
+    process.exit(1)
+  })
+})
+
+process.on('SIGTERM', () => {
+  gracefulShutdown('SIGTERM').then(() => process.exit(0))
+})
+
+process.on('SIGINT', () => {
+  gracefulShutdown('SIGINT').then(() => process.exit(0))
 })
 
 function authHeaders() {
@@ -914,6 +963,191 @@ class EdgeClient {
       console.error(`[status:${instanceId}] update failed (${status}): ${normalizeReason(error)}`)
     }
   }
+
+  async acquireInstanceLock({ instanceId, instanceOwner, ttlMs }) {
+    return this.post('/instance-lock/acquire', {
+      instanceId,
+      instance_owner: instanceOwner,
+      ttl_ms: ttlMs,
+    })
+  }
+
+  async renewInstanceLock({ instanceId, instanceOwner, ttlMs, lockToken }) {
+    return this.post('/instance-lock/renew', {
+      instanceId,
+      instance_owner: instanceOwner,
+      ttl_ms: ttlMs,
+      lock_token: lockToken || null,
+    })
+  }
+
+  async releaseInstanceLock({ instanceId, instanceOwner, lockToken }) {
+    return this.post('/instance-lock/release', {
+      instanceId,
+      instance_owner: instanceOwner,
+      lock_token: lockToken || null,
+    })
+  }
+}
+
+function parseLockPayload(payload) {
+  const acquired = payload?.acquired ?? payload?.lock_acquired ?? false
+  const owner = payload?.instance_owner || payload?.owner || null
+  const lockToken = payload?.lock_token || payload?.token || null
+  return {
+    acquired: Boolean(acquired),
+    owner,
+    lockToken,
+  }
+}
+
+class InstanceLockCoordinator {
+  constructor(edgeClient, { onLockLost }) {
+    this.edgeClient = edgeClient
+    this.onLockLost = onLockLost
+    this.ownership = new Map()
+  }
+
+  getOwner(instanceId) {
+    return this.ownership.get(instanceId)?.instanceOwner || null
+  }
+
+  hasOwnership(instanceId) {
+    return this.ownership.has(instanceId)
+  }
+
+  async acquire(instanceId) {
+    const response = await this.edgeClient.acquireInstanceLock({
+      instanceId,
+      instanceOwner: PROCESS_OWNER_ID,
+      ttlMs: LOCK_TTL_MS,
+    })
+
+    const { acquired, owner, lockToken } = parseLockPayload(response)
+    if (!acquired) {
+      console.warn(
+        `[lock_conflict] instance=${instanceId} instance_owner=${owner || 'unknown'} requester=${PROCESS_OWNER_ID}`,
+      )
+      return false
+    }
+
+    this.setOwnership(instanceId, {
+      instanceOwner: owner || PROCESS_OWNER_ID,
+      lockToken,
+    })
+
+    console.log(
+      `[lock_acquired] instance=${instanceId} instance_owner=${this.getOwner(instanceId)} ttlMs=${LOCK_TTL_MS}`,
+    )
+    return true
+  }
+
+  setOwnership(instanceId, { instanceOwner, lockToken }) {
+    const current = this.ownership.get(instanceId)
+    if (current?.renewInterval) {
+      clearInterval(current.renewInterval)
+    }
+
+    const state = {
+      instanceOwner,
+      lockToken,
+      renewInterval: setInterval(() => {
+        this.renew(instanceId).catch((error) => {
+          console.error(`[lock_renew_error] instance=${instanceId} error=${normalizeReason(error)}`)
+        })
+      }, LOCK_RENEW_INTERVAL_MS),
+    }
+
+    this.ownership.set(instanceId, state)
+  }
+
+  async renew(instanceId) {
+    const state = this.ownership.get(instanceId)
+    if (!state) {
+      return false
+    }
+
+    const response = await this.edgeClient.renewInstanceLock({
+      instanceId,
+      instanceOwner: state.instanceOwner,
+      ttlMs: LOCK_TTL_MS,
+      lockToken: state.lockToken,
+    })
+    const { acquired, owner, lockToken } = parseLockPayload(response)
+
+    if (!acquired) {
+      console.error(
+        `[lock_conflict] instance=${instanceId} instance_owner=${owner || 'unknown'} requester=${PROCESS_OWNER_ID}`,
+      )
+      await this.clearOwnership(instanceId, { releaseRemote: false })
+      await this.onLockLost(instanceId)
+      return false
+    }
+
+    state.lockToken = lockToken || state.lockToken
+    if (owner) {
+      state.instanceOwner = owner
+    }
+    console.log(`[instance_owner] instance=${instanceId} instance_owner=${state.instanceOwner}`)
+    return true
+  }
+
+  async release(instanceId, { reason = 'unknown' } = {}) {
+    const state = this.ownership.get(instanceId)
+    if (!state) {
+      return false
+    }
+
+    try {
+      await this.edgeClient.releaseInstanceLock({
+        instanceId,
+        instanceOwner: state.instanceOwner,
+        lockToken: state.lockToken,
+      })
+    } catch (error) {
+      console.error(
+        `[lock_release_error] instance=${instanceId} reason=${reason} error=${normalizeReason(error)}`,
+      )
+    }
+
+    await this.clearOwnership(instanceId, { releaseRemote: false })
+    console.log(`[lock_released] instance=${instanceId} reason=${reason}`)
+    return true
+  }
+
+  async clearOwnership(instanceId, { releaseRemote = true } = {}) {
+    const state = this.ownership.get(instanceId)
+    if (!state) {
+      return
+    }
+
+    if (state.renewInterval) {
+      clearInterval(state.renewInterval)
+    }
+
+    this.ownership.delete(instanceId)
+
+    if (!releaseRemote) {
+      return
+    }
+
+    try {
+      await this.edgeClient.releaseInstanceLock({
+        instanceId,
+        instanceOwner: state.instanceOwner,
+        lockToken: state.lockToken,
+      })
+    } catch (error) {
+      console.error(`[lock_release_error] instance=${instanceId} error=${normalizeReason(error)}`)
+    }
+  }
+
+  async releaseAll({ reason = 'shutdown' } = {}) {
+    const ids = [...this.ownership.keys()]
+    for (const instanceId of ids) {
+      await this.release(instanceId, { reason })
+    }
+  }
 }
 
 class InstanceRuntime {
@@ -945,6 +1179,12 @@ class InstanceManager {
     this.desiredIds = new Set()
     this.discoveryInterval = null
     this.discoveryRunning = false
+    this.isShuttingDown = false
+    this.lockCoordinator = new InstanceLockCoordinator(this.edgeClient, {
+      onLockLost: async (instanceId) => {
+        await this.handleLockLost(instanceId)
+      },
+    })
   }
 
   isDesired(instanceId) {
@@ -963,13 +1203,25 @@ class InstanceManager {
   }
 
   async ensureRunning(instanceId) {
+    if (!this.lockCoordinator.hasOwnership(instanceId)) {
+      const acquired = await this.lockCoordinator.acquire(instanceId)
+      if (!acquired) {
+        return false
+      }
+    }
+
     const runtime = this.getOrCreateRuntime(instanceId)
     if (runtime.isBusy() || runtime.sock) {
       return false
     }
 
-    await runtime.connection.connect()
-    return true
+    try {
+      await runtime.connection.connect()
+      return true
+    } catch (error) {
+      await this.lockCoordinator.release(instanceId, { reason: 'connect-failure' })
+      throw error
+    }
   }
 
   canStop(runtime) {
@@ -987,12 +1239,19 @@ class InstanceManager {
   async stopGracefully(instanceId) {
     const runtime = this.runtimes.get(instanceId)
     if (!runtime) {
+      await this.lockCoordinator.release(instanceId, { reason: 'runtime-missing' })
       return false
     }
 
     await runtime.connection.stopGracefully()
     this.runtimes.delete(instanceId)
+    await this.lockCoordinator.release(instanceId, { reason: 'stop-gracefully' })
     return true
+  }
+
+  async handleLockLost(instanceId) {
+    console.error(`[lock_lost] instance=${instanceId} requester=${PROCESS_OWNER_ID}`)
+    await this.stopGracefully(instanceId)
   }
 
   stablePrioritize(instances) {
@@ -1099,10 +1358,32 @@ class InstanceManager {
     await fs.mkdir(AUTH_BASE, { recursive: true })
     await this.discoveryCycle()
     this.discoveryInterval = setInterval(() => {
+      if (this.isShuttingDown) {
+        return
+      }
       this.discoveryCycle().catch((error) => {
         console.error(`[discovery] cycle crash: ${normalizeReason(error)}`)
       })
     }, DISCOVERY_POLL_MS)
+  }
+
+  async shutdown({ signal }) {
+    this.isShuttingDown = true
+    if (this.discoveryInterval) {
+      clearInterval(this.discoveryInterval)
+      this.discoveryInterval = null
+    }
+
+    const runtimeIds = [...this.runtimes.keys()]
+    for (const instanceId of runtimeIds) {
+      try {
+        await this.stopGracefully(instanceId)
+      } catch (error) {
+        console.error(`[shutdown] stop failed instance=${instanceId} error=${normalizeReason(error)}`)
+      }
+    }
+
+    await this.lockCoordinator.releaseAll({ reason: signal || 'shutdown' })
   }
 }
 
@@ -1147,6 +1428,7 @@ async function start() {
   }
 
   const manager = new InstanceManager()
+  instanceManager = manager
   await manager.start()
   await new Promise(() => {})
 }
