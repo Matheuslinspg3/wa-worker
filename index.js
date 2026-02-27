@@ -1246,8 +1246,47 @@ class ConnectionRunner {
 }
 
 class EdgeClient {
+  absoluteUrl(endpoint) {
+    return `${EDGE_BASE_URL}${endpoint}`
+  }
+
   async get(endpoint) {
     return requestJson('GET', endpoint)
+  }
+
+  async getEligibleInstances(endpoint) {
+    const url = this.absoluteUrl(endpoint)
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS)
+
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${WORKER_SECRET}` },
+        signal: controller.signal,
+      })
+
+      console.log(`[discovery] eligible-instances url=${url} status=${response.status}`)
+
+      const rawBody = await safeReadBody(response)
+
+      if (response.status !== 200) {
+        console.error(`[discovery] eligible-instances non-200 body=${rawBody}`)
+        const error = new Error(`HTTP ${response.status}${rawBody ? `: ${rawBody.slice(0, 220)}` : ''}`)
+        error.statusCode = response.status
+        error.responseBody = rawBody
+        throw error
+      }
+
+      try {
+        return rawBody ? JSON.parse(rawBody) : null
+      } catch (error) {
+        console.error(`[discovery] eligible-instances invalid JSON body=${rawBody}`)
+        throw error
+      }
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
   async post(endpoint, payload) {
@@ -1613,17 +1652,22 @@ class InstanceManager {
     const stoppedIds = []
 
     try {
+      const eligibleInstancesEndpoint = '/eligible-instances?enabled=true&limit=50&order=priority.desc'
+
       const [settings, candidatesPayload] = await Promise.all([
         this.edgeClient.get('/worker-settings').catch((error) => {
           console.error(`[discovery] worker-settings unavailable: ${normalizeReason(error)}`)
           return null
         }),
-        this.edgeClient.get('/eligible-instances?enabled=true&limit=50&order=priority.desc'),
+        this.edgeClient.getEligibleInstances(eligibleInstancesEndpoint),
       ])
 
-      const instancesRaw = Array.isArray(candidatesPayload?.instances)
-        ? candidatesPayload.instances.filter((item) => item?.id)
-        : []
+      if (!Array.isArray(candidatesPayload?.instances)) {
+        console.error('[discovery] eligible-instances payload missing instances array; skipping cycle')
+        return
+      }
+
+      const instancesRaw = candidatesPayload.instances.filter((item) => item?.id)
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
@@ -1657,18 +1701,6 @@ class InstanceManager {
           } catch (error) {
             console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
           }
-        }
-      }
-
-      if (targetIds.length === 0 && maxActiveInstances > 0 && this.runtimes.size > 0) {
-        const runtimeFallback = [...this.runtimes.values()]
-          .sort((a, b) => (Number(b.priority) || 0) - (Number(a.priority) || 0))
-          .slice(0, maxActiveInstances)
-          .map((runtime) => runtime.instanceId)
-
-        if (runtimeFallback.length > 0) {
-          console.warn('[discovery] eligible-instances returned empty, preserving current runtimes as fallback targets')
-          targetIds.push(...runtimeFallback)
         }
       }
 
