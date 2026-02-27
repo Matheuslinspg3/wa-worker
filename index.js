@@ -42,6 +42,14 @@ const FALLBACK_MAX_ACTIVE_INSTANCES = Math.max(
 const BAD_MAC_WINDOW_MS = Math.max(1_000, Number(process.env.BAD_MAC_WINDOW_MS) || 60_000)
 const BAD_MAC_THRESHOLD = Math.max(1, Number(process.env.BAD_MAC_THRESHOLD) || 20)
 const BAD_MAC_COOLDOWN_MS = Math.max(10_000, Number(process.env.BAD_MAC_COOLDOWN_MS) || 300_000)
+const CONTACT_RESOLVE_ERROR_COOLDOWN_MS = Math.max(
+  10_000,
+  Number(process.env.CONTACT_RESOLVE_ERROR_COOLDOWN_MS) || 60_000,
+)
+const CONTACT_RESOLVE_DUPLICATE_COOLDOWN_MS = Math.max(
+  30_000,
+  Number(process.env.CONTACT_RESOLVE_DUPLICATE_COOLDOWN_MS) || 300_000,
+)
 
 const SIGNAL_SESSION_ERROR_SNIPPETS = [
   'bad mac',
@@ -120,6 +128,36 @@ function parseStatusCode(error) {
     error?.status ||
     null
   )
+}
+
+function hasDuplicateContactConflict(errorLike) {
+  const statusCode = parseStatusCode(errorLike)
+  if (statusCode === 409) {
+    return true
+  }
+
+  const serialized = String(errorLike?.message || errorLike || '').toLowerCase()
+  return (
+    serialized.includes('contacts_instance_id_jid_key') ||
+    (serialized.includes('duplicate key value') && serialized.includes('contacts'))
+  )
+}
+
+function extractSenderPn(message) {
+  const candidates = [
+    message?.key?.senderPn,
+    message?.senderPn,
+    message?.messageContextInfo?.senderPn,
+  ]
+
+  for (const candidate of candidates) {
+    const jid = String(candidate || '').trim()
+    if (jid.endsWith('@s.whatsapp.net')) {
+      return jid
+    }
+  }
+
+  return null
 }
 
 function extractInboundContent(message) {
@@ -545,6 +583,7 @@ class ConnectionRunner {
     this.badMacTimestamps = []
     this.badMacBreakerUntil = 0
     this.badMacBreakerRunning = false
+    this.contactResolveCache = new Map()
     this.outbound = new OutboundQueueRunner(runtime, edgeClient)
   }
 
@@ -589,6 +628,73 @@ class ConnectionRunner {
     }
   }
 
+  resolveCacheKey(instanceId, jid) {
+    return `${instanceId}:${jid}`
+  }
+
+  getCachedContactResolve(instanceId, jid) {
+    const key = this.resolveCacheKey(instanceId, jid)
+    const cached = this.contactResolveCache.get(key)
+    if (!cached) {
+      return null
+    }
+
+    if (cached.expiresAt <= Date.now()) {
+      this.contactResolveCache.delete(key)
+      return null
+    }
+
+    return cached
+  }
+
+  cacheContactResolve(instanceId, jid, data) {
+    this.contactResolveCache.set(this.resolveCacheKey(instanceId, jid), data)
+  }
+
+  async resolveSenderContactId({ instanceId, contactJid, pushName }) {
+    if (!contactJid) {
+      return null
+    }
+
+    const cached = this.getCachedContactResolve(instanceId, contactJid)
+    if (cached) {
+      return cached.contactId
+    }
+
+    try {
+      const resolved = await this.edgeClient.resolveContact({
+        instanceId,
+        jid: contactJid,
+        jid_type: resolveJidType(contactJid),
+        push_name: pushName,
+      })
+      const contactId = resolved?.contact_id || resolved?.id || null
+      this.cacheContactResolve(instanceId, contactJid, {
+        contactId,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      })
+      return contactId
+    } catch (error) {
+      if (hasDuplicateContactConflict(error)) {
+        this.cacheContactResolve(instanceId, contactJid, {
+          contactId: null,
+          expiresAt: Date.now() + CONTACT_RESOLVE_DUPLICATE_COOLDOWN_MS,
+        })
+        console.log(`[contact-resolve:${instanceId}] duplicate ignored jid=${contactJid}`)
+        return null
+      }
+
+      this.cacheContactResolve(instanceId, contactJid, {
+        contactId: null,
+        expiresAt: Date.now() + CONTACT_RESOLVE_ERROR_COOLDOWN_MS,
+      })
+      console.warn(
+        `[contact-resolve:${instanceId}] failed jid=${contactJid} error=${normalizeReason(error)}`,
+      )
+      return null
+    }
+  }
+
   bindEvents(saveCreds) {
     this.sock.ev.on('creds.update', saveCreds)
 
@@ -612,8 +718,10 @@ class ConnectionRunner {
           : key.fromMe
             ? this.sock?.user?.id || chatIdNorm
             : chatIdNorm
-        const contactJid =
-          key.fromMe && senderJidRaw === this.sock?.user?.id ? chatIdNorm : senderJidRaw
+        const senderPn = extractSenderPn(msg)
+        const contactJid = key.fromMe
+          ? chatIdNorm
+          : senderPn || senderJidRaw
 
         console.log('[identity]', {
           chatId: chatIdNorm,
@@ -622,21 +730,13 @@ class ConnectionRunner {
           sockUser: this.sock?.user?.id,
         })
         const pushName = resolvePushName(upsert, msg)
-
-        let senderContactId = null
-        try {
-          const resolved = await this.edgeClient.resolveContact({
-            instanceId,
-            jid: contactJid,
-            jid_type: resolveJidType(contactJid),
-            push_name: pushName,
-          })
-          senderContactId = resolved?.contact_id || resolved?.id || null
-        } catch (error) {
-          console.warn(
-            `[contact-resolve:${instanceId}] failed jid=${contactJid} error=${normalizeReason(error)}`,
-          )
-        }
+        const senderContactId = key.fromMe
+          ? null
+          : await this.resolveSenderContactId({
+              instanceId,
+              contactJid,
+              pushName,
+            })
 
         const { mediaType, body, content } = extractInboundContent(msg)
 
