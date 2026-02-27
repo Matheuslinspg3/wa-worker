@@ -172,6 +172,10 @@ function resolvePushName(upsert, message) {
   return upsert?.pushName || message?.pushName || null
 }
 
+function resolveJidType(jid) {
+  return String(jid || '').trim().endsWith('@lid') ? 'lid' : 'pn'
+}
+
 function normalizeDigits(value) {
   return String(value || '').replace(/\D/g, '')
 }
@@ -330,13 +334,13 @@ class OutboundQueueRunner {
   async resolveDestination(queued) {
     const originalTo = String(queued?.to || '').trim()
     if (originalTo.endsWith('@lid')) {
-      const resolved = await this.edgeClient.resolveLid(this.runtime.instanceId, originalTo)
-      const jidPn = String(resolved?.jid_pn || '').trim()
+      const resolved = await this.edgeClient.primaryJid(this.runtime.instanceId, originalTo)
+      const jidPn = String(resolved?.jid_pn || resolved?.jid || '').trim()
       if (!jidPn) {
         return {
           originalTo,
           toNormalized: null,
-          error: 'invalid-destination:lid',
+          error: 'lid_without_mapping',
         }
       }
       return {
@@ -413,6 +417,11 @@ class OutboundQueueRunner {
             await this.edgeClient.post('/mark-failed', {
               messageId: queued.id,
               error: reason,
+              send_debug: {
+                toOriginal: originalTo,
+                toNormalized,
+                reason,
+              },
             })
           } catch (error) {
             markStatus = normalizeReason(error)
@@ -593,47 +602,81 @@ class ConnectionRunner {
       for (const msg of upsert.messages) {
         if (!msg) continue
 
-        const lidPn = extractLidPnPair(msg)
-        if (lidPn) {
+        const key = msg.key
+        const chatIdNorm = key?.remoteJid
+        if (!chatIdNorm) continue
+
+        const isGroup = chatIdNorm.endsWith('@g.us')
+        const senderJidRaw = isGroup ? key.participant || chatIdNorm : chatIdNorm
+        const pushName = resolvePushName(upsert, msg)
+
+        let senderContactId = null
+        try {
+          const resolved = await this.edgeClient.resolveContact({
+            instanceId,
+            jid: senderJidRaw,
+            jid_type: resolveJidType(senderJidRaw),
+            push_name: pushName,
+          })
+          senderContactId = resolved?.contact_id || resolved?.id || null
+        } catch (error) {
+          console.warn(
+            `[contact-resolve:${instanceId}] failed jid=${senderJidRaw} error=${normalizeReason(error)}`,
+          )
+        }
+
+        const { mediaType, body, content } = extractInboundContent(msg)
+
+        if (!body && !mediaType) continue
+
+        let mediaUrl = null
+        let mimeType = null
+        let fileName = null
+        let fileSize = null
+        if (mediaType && content) {
           try {
-            await this.edgeClient.upsertContact({
-              ...lidPn,
-              push_name: resolvePushName(upsert, msg),
+            const mediaBuffer = await downloadInboundMedia(content, mediaType)
+            mimeType = content?.mimetype || null
+            fileName =
+              content?.fileName ||
+              `${key.id || `msg-${Date.now()}`}.${inferExtension({
+                mimeType,
+                fileName: content?.fileName || '',
+                mediaType,
+              })}`
+            fileSize = mediaBuffer.length
+
+            const uploaded = await this.edgeClient.uploadMedia({
+              instanceId,
+              messageId: key.id || null,
+              mime_type: mimeType,
+              file_name: sanitizeFileName(fileName),
+              bytes_base64: mediaBuffer.toString('base64'),
             })
+            mediaUrl = uploaded?.media_url || null
           } catch (error) {
-            console.warn(
-              `[contact-upsert:${instanceId}] failed jid_lid=${lidPn.jid_lid} jid_pn=${lidPn.jid_pn} error=${normalizeReason(error)}`,
-            )
+            console.error(`[inbound-media] ERROR instance=${instanceId} messageId=${key.id || 'n/a'}`, error)
           }
         }
 
-        const key = msg.key
-        const chatId = key?.remoteJid
-        if (!chatId) continue
-
-        const isGroup = chatId.endsWith('@g.us')
-        const senderId = isGroup ? key.participant || chatId : chatId
-
-        const m = msg.message || {}
-        const body =
-          m.conversation ||
-          m.extendedTextMessage?.text ||
-          m.imageMessage?.caption ||
-          m.videoMessage?.caption ||
-          ''
-
-        if (!body) continue
+        if (mediaType && !mediaUrl) continue
 
         const payload = {
           instanceId,
-          from: senderId,
+          from: senderJidRaw,
           to: this.sock?.user?.id || '',
           body,
           wa_message_id: key.id || null,
           from_me: !!key.fromMe,
-          chat_id_norm: chatId,
-          sender_id: senderId,
-          push_name: upsert.pushName || msg.pushName || null,
+          chat_id_norm: chatIdNorm,
+          sender_jid_raw: senderJidRaw,
+          sender_contact_id: senderContactId,
+          push_name: pushName,
+          media_type: mediaType,
+          media_url: mediaUrl,
+          mime_type: mimeType,
+          file_name: fileName,
+          file_size: fileSize,
         }
 
         try {
@@ -649,7 +692,7 @@ class ConnectionRunner {
           if (!res.ok) {
             console.error(`[inbound] FAIL instance=${instanceId} status=${res.status} body=${txt}`)
           } else {
-            console.log(`[inbound] ok instance=${instanceId} chat=${chatId}`)
+            console.log(`[inbound] ok instance=${instanceId} chat=${chatIdNorm}`)
           }
         } catch (error) {
           this.registerSignalSessionError(error, 'inbound-delivery')
@@ -830,13 +873,21 @@ class EdgeClient {
   }
 
   async resolveLid(instanceId, jid) {
+    return this.primaryJid(instanceId, jid)
+  }
+
+  async primaryJid(instanceId, jid) {
     return this.get(
-      `/resolve-lid?instanceId=${encodeURIComponent(instanceId)}&jid=${encodeURIComponent(jid)}`,
+      `/contacts/primary-jid?instanceId=${encodeURIComponent(instanceId)}&jid=${encodeURIComponent(jid)}`,
     )
   }
 
-  async upsertContact(payload) {
-    return this.post('/upsert-contact', payload)
+  async resolveContact(payload) {
+    return this.post('/contacts/resolve', payload)
+  }
+
+  async uploadMedia(payload) {
+    return this.post('/upload-media', payload)
   }
 
   async safeUpdateStatus(instanceId, status, qrCode) {
