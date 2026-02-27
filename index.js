@@ -1668,45 +1668,34 @@ class InstanceManager {
       const candidatesPayload = candidatesResponse?.payload
       const bodyText = candidatesResponse?.bodyText
 
-      if (!Array.isArray(candidatesPayload?.instances)) {
-        console.error('[discovery] eligible-instances payload missing instances array; skipping cycle')
-        return
-      }
+      const list = candidatesPayload?.instances ?? candidatesPayload?.data ?? []
+      const parsedInstances = Array.isArray(list) ? list : []
+      const instancesRaw = parsedInstances.filter((item) => item?.id)
+      const parsedIds = instancesRaw.map((instance) => String(instance.id))
 
-      const instancesRaw = candidatesPayload.instances.filter((item) => item?.id)
+      console.log(`[discovery] parsed instances count=${instancesRaw.length} ids=${JSON.stringify(parsedIds)}`)
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
-      const targetIds = []
+      const targetInstances = maxActiveInstances > 0 ? ordered.slice(0, maxActiveInstances) : []
+      const targetIds = targetInstances.map((instance) => String(instance.id))
 
-      if (maxActiveInstances > 0) {
-        for (const instance of ordered) {
-          if (targetIds.length >= maxActiveInstances) {
-            break
+      for (const instance of targetInstances) {
+        const candidate = String(instance.id)
+
+        try {
+          const started = await this.ensureRunning(candidate)
+          const runtime = this.runtimes.get(candidate)
+
+          if (runtime) {
+            runtime.priority = numberOrFallback(instance.priority, 0)
           }
 
-          const candidate = String(instance.id)
-
-          try {
-            const started = await this.ensureRunning(candidate)
-            const runtime = this.runtimes.get(candidate)
-
-            if (runtime) {
-              runtime.priority = numberOrFallback(instance.priority, 0)
-            }
-
-            const isActive = Boolean(runtime && (runtime.isBusy() || runtime.sock || runtime.isConnected()))
-
-            if (started) {
-              startedIds.push(candidate)
-            }
-
-            if (started || isActive) {
-              targetIds.push(candidate)
-            }
-          } catch (error) {
-            console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
+          if (started) {
+            startedIds.push(candidate)
           }
+        } catch (error) {
+          console.error(`[discovery] ensureRunning failed for ${candidate}: ${normalizeReason(error)}`)
         }
       }
 
