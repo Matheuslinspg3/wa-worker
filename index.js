@@ -1221,12 +1221,22 @@ class ConnectionRunner {
 
   async wipeAuthAndRestart(trigger) {
     console.warn(`[conn:${this.runtime.instanceId}] applying auth wipe trigger=${trigger}`)
+    this.intentionalStop = true
     this.clearReconnect()
     this.outbound.stop()
+    const oldSock = this.sock
     this.sock = null
     this.runtime.sock = null
     this.connecting = false
     this.connected = false
+
+    if (oldSock) {
+      try {
+        oldSock.end(new Error('auth wipe restart'))
+      } catch (endError) {
+        // socket may already be closed; ignore
+      }
+    }
 
     try {
       await fs.rm(this.authPath, { recursive: true, force: true })
