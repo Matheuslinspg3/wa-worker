@@ -35,6 +35,8 @@ const HTTP_TIMEOUT_MS = 10_000
 const KEEP_ALIVE_MS = 60_000
 const STOP_COOLDOWN_MS = 60_000
 const RECONNECT_DELAYS_MS = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000]
+const DECRYPT_RETRY_MAX_ATTEMPTS = 3
+const SESSION_REFRESH_BACKOFF_MS = [1_000, 2_000, 5_000]
 const LOCK_TTL_MS = Math.max(5_000, Number(process.env.INSTANCE_LOCK_TTL_MS) || 30_000)
 const LOCK_RENEW_INTERVAL_MS = Math.max(
   2_000,
@@ -803,6 +805,7 @@ class ConnectionRunner {
     this.badMacBreakerUntil = 0
     this.badMacBreakerRunning = false
     this.contactResolveCache = new Map()
+    this.identityAliasStore = new IdentityAliasStore(path.join(AUTH_BASE, runtime.instanceId, 'identity-alias-map.json'))
     this.outbound = new OutboundQueueRunner(runtime, edgeClient)
   }
 
@@ -988,6 +991,9 @@ class ConnectionRunner {
           ? chatIdNorm
           : senderPn || senderJidRaw
 
+        const chatIdCanonical = await this.resolveCanonicalJid(chatIdNorm)
+        const senderJidCanonical = await this.resolveCanonicalJid(senderJidRaw, senderPn)
+
         console.log('[identity]', {
           chatId: chatIdNorm,
           senderJid: senderJidRaw,
@@ -997,6 +1003,7 @@ class ConnectionRunner {
           fromMe: !!key.fromMe,
           sockUser: this.sock?.user?.id,
         })
+
         const pushName = resolvePushName(upsert, msg)
         const senderContactId = key.fromMe
           ? null
