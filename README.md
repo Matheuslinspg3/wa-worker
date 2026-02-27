@@ -73,6 +73,8 @@ No `messages.upsert` (`type=notify`) envia para `/inbound`:
 - `sender_jid_raw` (obrigatório): grupo=`key.participant`, privado=`key.remoteJid`
 - `sender_pn` (opcional): JID canônico de pessoa (`@s.whatsapp.net`) quando disponível
 - `sender_contact_id` (opcional): resolvido via `POST /contacts/resolve` com `{ instanceId, jid, jid_type, push_name }`
+  - Para reduzir ruído por conflito de unicidade no backend (`contacts_instance_id_jid_key`), o worker aplica cache local por `instanceId+jid` e cooldown quando detecta duplicata.
+  - Mensagens `fromMe` não fazem `contacts/resolve` (define `sender_contact_id = null`) para evitar resolve redundante do próprio usuário.
 - `push_name` (opcional)
 - `wa_message_id` (opcional)
 - `timestamp` (opcional)
@@ -105,7 +107,8 @@ Regras:
 - `BAD_MAC_WINDOW_MS` (opcional, default `60000`)
 - `BAD_MAC_THRESHOLD` (opcional, default `20`)
 - `BAD_MAC_COOLDOWN_MS` (opcional, default `300000`)
-- `DECRYPT_RETRY_MAX_ATTEMPTS` (opcional, default `2`)
+- `CONTACT_RESOLVE_ERROR_COOLDOWN_MS` (opcional, default `60000`)
+- `CONTACT_RESOLVE_DUPLICATE_COOLDOWN_MS` (opcional, default `300000`)
 
 ## Persistência (obrigatória)
 
