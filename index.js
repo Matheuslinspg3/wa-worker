@@ -242,19 +242,7 @@ function normalizeOutboundTo(message) {
   }
 
   if (originalTo.includes('@lid')) {
-    const toPnDigits = normalizeDigits(message?.to_pn)
-    if (!toPnDigits) {
-      return {
-        error: 'lid-without-to_pn',
-        originalTo,
-        toNormalized: null,
-      }
-    }
-
-    return {
-      originalTo,
-      toNormalized: `${toPnDigits}@s.whatsapp.net`,
-    }
+    return { error: 'lid', originalTo, toNormalized: null }
   }
 
   const digits = normalizeDigits(originalTo)
@@ -304,6 +292,9 @@ class OutboundQueueRunner {
 
   start() {
     this.stop()
+    this.tick().catch((error) => {
+      console.error(`[queue:${this.runtime.instanceId}] tick failed: ${normalizeReason(error)}`)
+    })
     this.interval = setInterval(() => {
       this.tick().catch((error) => {
         console.error(`[queue:${this.runtime.instanceId}] tick failed: ${normalizeReason(error)}`)
@@ -329,8 +320,10 @@ class OutboundQueueRunner {
         `/queued-messages?instanceId=${encodeURIComponent(this.runtime.instanceId)}`,
       )
       const messages = Array.isArray(payload) ? payload : payload?.messages
+      const count = Array.isArray(messages) ? messages.length : 0
+      console.log(`[queue] polled count=${count} instance=${this.runtime.instanceId}`)
 
-      if (!Array.isArray(messages) || messages.length === 0) {
+      if (count === 0) {
         return
       }
 
@@ -345,17 +338,21 @@ class OutboundQueueRunner {
         }
 
         const { originalTo, toNormalized, error: toError } = normalizeOutboundTo(queued)
+        console.log(`[send] toOriginal=${originalTo} toNormalized=${toNormalized}`)
 
         if (toError) {
           const reason = `invalid-destination:${toError}`
+          let markStatus = 'ok'
           try {
             await this.edgeClient.post('/mark-failed', {
               messageId: queued.id,
               error: reason,
             })
-          } catch {
+          } catch (error) {
+            markStatus = normalizeReason(error)
             console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
           }
+          console.log(`[mark-failed] ok status=${markStatus}`)
           console.error(
             `[queue:${this.runtime.instanceId}] send skipped for ${queued.id}: ${reason} toOriginal=${originalTo} toNormalized=${toNormalized}`,
           )
@@ -368,16 +365,20 @@ class OutboundQueueRunner {
             messageId: queued.id,
             wa_message_id: sent?.key?.id || null,
           })
+          console.log('[mark-sent] ok')
         } catch (error) {
           const reason = normalizeReason(error)
+          let markStatus = 'ok'
           try {
             await this.edgeClient.post('/mark-failed', {
               messageId: queued.id,
               error: reason,
             })
-          } catch {
+          } catch (markError) {
+            markStatus = normalizeReason(markError)
             console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
           }
+          console.log(`[mark-failed] ok status=${markStatus}`)
           console.error(
             `[queue:${this.runtime.instanceId}] send failed for ${queued.id}: ${reason} toOriginal=${originalTo} toNormalized=${toNormalized}`,
           )
