@@ -241,10 +241,6 @@ function normalizeOutboundTo(message) {
     return { originalTo, toNormalized: originalTo }
   }
 
-  if (originalTo.includes('@lid')) {
-    return { error: 'lid', originalTo, toNormalized: null }
-  }
-
   const digits = normalizeDigits(originalTo)
   if (digits && digits === originalTo) {
     return { originalTo, toNormalized: `${digits}@s.whatsapp.net` }
@@ -255,6 +251,47 @@ function normalizeOutboundTo(message) {
   }
 
   return { originalTo, toNormalized: originalTo }
+}
+
+function extractLidPnPair(message) {
+  const key = message?.key || {}
+  const candidates = [
+    key.remoteJid,
+    key.remoteJidAlt,
+    key.participant,
+    key.participantAlt,
+    message?.participant,
+    message?.participantAlt,
+    message?.sender,
+    message?.senderAlt,
+  ].filter(Boolean)
+
+  let jidLid = null
+  let jidPn = null
+
+  for (const candidate of candidates) {
+    const jid = String(candidate || '').trim()
+    if (!jid) {
+      continue
+    }
+
+    if (!jidLid && jid.endsWith('@lid')) {
+      jidLid = jid
+    }
+
+    if (!jidPn && jid.endsWith('@s.whatsapp.net')) {
+      jidPn = jid
+    }
+  }
+
+  if (!jidLid || !jidPn) {
+    return null
+  }
+
+  return {
+    jid_lid: jidLid,
+    jid_pn: jidPn,
+  }
 }
 
 function shouldWipeAuth(update) {
@@ -288,6 +325,35 @@ class OutboundQueueRunner {
     this.edgeClient = edgeClient
     this.interval = null
     this.processing = false
+  }
+
+  async resolveDestination(queued) {
+    const originalTo = String(queued?.to || '').trim()
+    if (originalTo.endsWith('@lid')) {
+      const resolved = await this.edgeClient.resolveLid(this.runtime.instanceId, originalTo)
+      const jidPn = String(resolved?.jid_pn || '').trim()
+      if (!jidPn) {
+        return {
+          originalTo,
+          toNormalized: null,
+          error: 'invalid-destination:lid',
+        }
+      }
+      return {
+        originalTo,
+        toNormalized: jidPn,
+      }
+    }
+
+    const normalized = normalizeOutboundTo(queued)
+    if (normalized?.error) {
+      return {
+        ...normalized,
+        error: `invalid-destination:${normalized.error}`,
+      }
+    }
+
+    return normalized
   }
 
   start() {
@@ -337,11 +403,11 @@ class OutboundQueueRunner {
           continue
         }
 
-        const { originalTo, toNormalized, error: toError } = normalizeOutboundTo(queued)
+        const { originalTo, toNormalized, error: toError } = await this.resolveDestination(queued)
         console.log(`[send] toOriginal=${originalTo} toNormalized=${toNormalized}`)
 
         if (toError) {
-          const reason = `invalid-destination:${toError}`
+          const reason = toError
           let markStatus = 'ok'
           try {
             await this.edgeClient.post('/mark-failed', {
@@ -526,6 +592,20 @@ class ConnectionRunner {
 
       for (const msg of upsert.messages) {
         if (!msg) continue
+
+        const lidPn = extractLidPnPair(msg)
+        if (lidPn) {
+          try {
+            await this.edgeClient.upsertContact({
+              ...lidPn,
+              push_name: resolvePushName(upsert, msg),
+            })
+          } catch (error) {
+            console.warn(
+              `[contact-upsert:${instanceId}] failed jid_lid=${lidPn.jid_lid} jid_pn=${lidPn.jid_pn} error=${normalizeReason(error)}`,
+            )
+          }
+        }
 
         const key = msg.key
         const chatId = key?.remoteJid
@@ -747,6 +827,16 @@ class EdgeClient {
 
   async post(endpoint, payload) {
     return requestJson('POST', endpoint, payload)
+  }
+
+  async resolveLid(instanceId, jid) {
+    return this.get(
+      `/resolve-lid?instanceId=${encodeURIComponent(instanceId)}&jid=${encodeURIComponent(jid)}`,
+    )
+  }
+
+  async upsertContact(payload) {
+    return this.post('/upsert-contact', payload)
   }
 
   async safeUpdateStatus(instanceId, status, qrCode) {
