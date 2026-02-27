@@ -209,6 +209,10 @@ function normalizeReason(error) {
   return error.message || 'unknown'
 }
 
+function isHttpStatusError(error, statusCode) {
+  return Number(error?.statusCode || error?.status || 0) === Number(statusCode)
+}
+
 function numberOrFallback(value, fallback) {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
@@ -864,6 +868,7 @@ class ConnectionRunner {
     this.connecting = true
 
     try {
+      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', null)
       const { state, saveCreds } = await useMultiFileAuthState(this.authPath)
       const { version } = await fetchLatestBaileysVersion()
       this.sock = makeWASocket({ auth: state, version })
@@ -1336,11 +1341,20 @@ class InstanceLockCoordinator {
   }
 
   async acquire(instanceId) {
-    const response = await this.edgeClient.acquireInstanceLock({
-      instanceId,
-      instanceOwner: PROCESS_OWNER_ID,
-      ttlMs: LOCK_TTL_MS,
-    })
+    let response
+    try {
+      response = await this.edgeClient.acquireInstanceLock({
+        instanceId,
+        instanceOwner: PROCESS_OWNER_ID,
+        ttlMs: LOCK_TTL_MS,
+      })
+    } catch (error) {
+      if (isHttpStatusError(error, 404)) {
+        console.warn(`[lock_skip] instance=${instanceId} reason=not_found`)
+        return false
+      }
+      throw error
+    }
 
     const { acquired, owner, lockToken } = parseLockPayload(response)
     if (!acquired) {
