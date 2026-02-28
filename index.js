@@ -881,7 +881,7 @@ class ConnectionRunner {
     this.connecting = true
 
     try {
-      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', null)
+      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING')
       const { state, saveCreds } = await useMultiFileAuthState(this.authPath)
       const { version } = await fetchLatestBaileysVersion()
       this.sock = makeWASocket({ auth: state, version })
@@ -1382,11 +1382,16 @@ class EdgeClient {
 
   async safeUpdateStatus(instanceId, status, qrCode) {
     try {
-      await this.post('/update-status', {
+      const payload = {
         instanceId,
         status,
-        qr_code: qrCode,
-      })
+      }
+
+      if (qrCode !== undefined) {
+        payload.qr_code = qrCode
+      }
+
+      await this.post('/update-status', payload)
     } catch (error) {
       console.error(`[status:${instanceId}] update failed (${status}): ${normalizeReason(error)}`)
     }
