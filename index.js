@@ -891,6 +891,7 @@ class ConnectionRunner {
       this.connecting = false
       this.sock = null
       this.runtime.sock = null
+      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'DISCONNECTED', null)
       throw error
     }
   }
@@ -1111,10 +1112,29 @@ class ConnectionRunner {
       if (update.qr) {
         try {
           const dataUrl = await QRCode.toDataURL(update.qr)
-          await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', dataUrl)
-          console.log(`[qr] ready instance=${this.runtime.instanceId} — awaiting scan`)
+          let delivered = false
+          for (let attempt = 0; attempt < 3 && !delivered; attempt++) {
+            if (attempt > 0) await sleep(SESSION_REFRESH_BACKOFF_MS[attempt - 1])
+            try {
+              await this.edgeClient.post('/update-status', {
+                instanceId: this.runtime.instanceId,
+                status: 'CONNECTING',
+                qr_code: dataUrl,
+              })
+              delivered = true
+            } catch (err) {
+              console.warn(
+                `[qr] delivery attempt=${attempt + 1} failed instance=${this.runtime.instanceId}: ${normalizeReason(err)}`,
+              )
+            }
+          }
+          if (delivered) {
+            console.log(`[qr] ready instance=${this.runtime.instanceId} — awaiting scan`)
+          } else {
+            console.error(`[qr] delivery failed after all retries instance=${this.runtime.instanceId}`)
+          }
         } catch (error) {
-          console.error(`[qr] failed instance=${this.runtime.instanceId}: ${normalizeReason(error)}`)
+          console.error(`[qr] generate failed instance=${this.runtime.instanceId}: ${normalizeReason(error)}`)
         }
       }
 
