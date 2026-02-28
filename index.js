@@ -109,11 +109,11 @@ process.on('unhandledRejection', (error) => {
 })
 
 process.on('SIGTERM', () => {
-  gracefulShutdown('SIGTERM').then(() => process.exit(0))
+  gracefulShutdown('SIGTERM').then(() => process.exit(0)).catch(() => process.exit(1))
 })
 
 process.on('SIGINT', () => {
-  gracefulShutdown('SIGINT').then(() => process.exit(0))
+  gracefulShutdown('SIGINT').then(() => process.exit(0)).catch(() => process.exit(1))
 })
 
 function authHeaders() {
@@ -650,11 +650,12 @@ class OutboundQueueRunner {
       )
       const messages = Array.isArray(payload) ? payload : payload?.messages
       const count = Array.isArray(messages) ? messages.length : 0
-      console.log(`[queue] polled count=${count} instance=${this.runtime.instanceId}`)
 
       if (count === 0) {
         return
       }
+
+      console.log(`[queue] polled count=${count} instance=${this.runtime.instanceId}`)
 
       for (const queued of messages) {
         if (!this.runtime.isConnected() || !this.runtime.sock) {
@@ -662,12 +663,22 @@ class OutboundQueueRunner {
         }
 
         if (!queued?.id || !queued?.to || (!queued?.body && !queued?.media_url)) {
-          console.warn(`[queue:${this.runtime.instanceId}] malformed queued message ignored`)
+          console.warn(`[queue:${this.runtime.instanceId}] malformed queued message id=${queued?.id || 'n/a'}`)
+          if (queued?.id) {
+            try {
+              await this.edgeClient.post('/mark-failed', {
+                messageId: queued.id,
+                error: 'malformed-message',
+                send_debug: { reason: 'missing required fields (to, body, or media_url)' },
+              })
+            } catch (markError) {
+              console.warn(`[queue:${this.runtime.instanceId}] mark-failed unavailable for ${queued.id}`)
+            }
+          }
           continue
         }
 
         const { originalTo, toNormalized, error: toError } = await this.resolveDestination(queued)
-        console.log(`[send] toOriginal=${originalTo} toNormalized=${toNormalized}`)
 
         if (toError) {
           const reason = toError
@@ -695,7 +706,6 @@ class OutboundQueueRunner {
 
         try {
           const result = await this.sendWithSessionRecovery(toNormalized, queued)
-          console.log('[send-result]', JSON.stringify(result))
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
             wa_message_id: result?.key?.id || null,
@@ -906,6 +916,14 @@ class ConnectionRunner {
 
   cacheContactResolve(instanceId, jid, data) {
     this.contactResolveCache.set(this.resolveCacheKey(instanceId, jid), data)
+    if (this.contactResolveCache.size > 500) {
+      const now = Date.now()
+      for (const [key, cached] of this.contactResolveCache) {
+        if (cached.expiresAt <= now) {
+          this.contactResolveCache.delete(key)
+        }
+      }
+    }
   }
 
   async resolveSenderContactId({ instanceId, contactJid, pushName }) {
@@ -957,8 +975,8 @@ class ConnectionRunner {
 
     this.sock.ev.on('messages.upsert', async (upsert) => {
       const instanceId = this.runtime.instanceId
-      console.log(`[upsert] instance=${instanceId} type=${upsert?.type} count=${upsert?.messages?.length || 0}`)
       if (!upsert?.messages?.length) return
+      console.log(`[upsert] instance=${instanceId} type=${upsert?.type} count=${upsert.messages.length}`)
 
       if (upsert.type && upsert.type !== 'notify' && upsert.type !== 'append') return
 
@@ -993,16 +1011,6 @@ class ConnectionRunner {
 
         const chatIdCanonical = await this.resolveCanonicalJid(chatIdNorm)
         const senderJidCanonical = await this.resolveCanonicalJid(senderJidRaw, senderPn)
-
-        console.log('[identity]', {
-          chatId: chatIdNorm,
-          senderJid: senderJidRaw,
-          senderPn,
-          chatIdCanonical,
-          senderJidCanonical,
-          fromMe: !!key.fromMe,
-          sockUser: this.sock?.user?.id,
-        })
 
         const pushName = resolvePushName(upsert, msg)
         const senderContactId = key.fromMe
@@ -1069,19 +1077,26 @@ class ConnectionRunner {
         }
 
         try {
-          const res = await fetch(`${EDGE_BASE_URL}/inbound`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${WORKER_SECRET}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload),
-          })
-          const txt = await res.text()
-          if (!res.ok) {
-            console.error(`[inbound] FAIL instance=${instanceId} status=${res.status} body=${txt}`)
-          } else {
-            console.log(`[inbound] ok instance=${instanceId} chat=${chatIdNorm}`)
+          const inboundController = new AbortController()
+          const inboundTimeout = setTimeout(() => inboundController.abort(), HTTP_TIMEOUT_MS)
+          try {
+            const res = await fetch(`${EDGE_BASE_URL}/inbound`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${WORKER_SECRET}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(payload),
+              signal: inboundController.signal,
+            })
+            const txt = await res.text()
+            if (!res.ok) {
+              console.error(`[inbound] FAIL instance=${instanceId} status=${res.status} body=${txt}`)
+            } else {
+              console.log(`[inbound] ok instance=${instanceId} chat=${chatIdNorm}`)
+            }
+          } finally {
+            clearTimeout(inboundTimeout)
           }
         } catch (error) {
           this.registerSignalSessionError(error, 'inbound-delivery')
@@ -1097,8 +1112,9 @@ class ConnectionRunner {
         try {
           const dataUrl = await QRCode.toDataURL(update.qr)
           await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', dataUrl)
+          console.log(`[qr] ready instance=${this.runtime.instanceId} — awaiting scan`)
         } catch (error) {
-          console.error(`[conn:${this.runtime.instanceId}] QR processing failed: ${normalizeReason(error)}`)
+          console.error(`[qr] failed instance=${this.runtime.instanceId}: ${normalizeReason(error)}`)
         }
       }
 
@@ -1109,7 +1125,7 @@ class ConnectionRunner {
         this.reconnectAttempt = 0
         this.badMacTimestamps = []
         this.clearReconnect()
-        console.log(`[conn:${this.runtime.instanceId}] open`)
+        console.log(`[conn:${this.runtime.instanceId}] open jid=${this.sock?.user?.id || 'unknown'}`)
         await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTED', null)
         this.outbound.start()
         return
@@ -1179,7 +1195,9 @@ class ConnectionRunner {
 
     this.badMacBreakerRunning = true
     this.badMacBreakerUntil = now + BAD_MAC_COOLDOWN_MS
-    this.tripBadMacCircuitBreaker(count).finally(() => {
+    this.tripBadMacCircuitBreaker(count).catch((error) => {
+      console.error(`[conn:${this.runtime.instanceId}] circuit-breaker failed: ${normalizeReason(error)}`)
+    }).finally(() => {
       this.badMacBreakerRunning = false
     })
   }
@@ -1195,12 +1213,22 @@ class ConnectionRunner {
 
   async wipeAuthAndRestart(trigger) {
     console.warn(`[conn:${this.runtime.instanceId}] applying auth wipe trigger=${trigger}`)
+    this.intentionalStop = true
     this.clearReconnect()
     this.outbound.stop()
+    const oldSock = this.sock
     this.sock = null
     this.runtime.sock = null
     this.connecting = false
     this.connected = false
+
+    if (oldSock) {
+      try {
+        oldSock.end(new Error('auth wipe restart'))
+      } catch (endError) {
+        // socket may already be closed; ignore
+      }
+    }
 
     try {
       await fs.rm(this.authPath, { recursive: true, force: true })
@@ -1208,8 +1236,15 @@ class ConnectionRunner {
       console.error(`[conn:${this.runtime.instanceId}] auth wipe failed: ${normalizeReason(error)}`)
     }
 
-    this.runtime.manager.resetRuntime(this.runtime.instanceId)
-    await this.runtime.manager.ensureRunning(this.runtime.instanceId)
+    try {
+      this.runtime.manager.resetRuntime(this.runtime.instanceId)
+      await this.runtime.manager.ensureRunning(this.runtime.instanceId)
+    } catch (error) {
+      console.error(
+        `[conn:${this.runtime.instanceId}] wipeAuthAndRestart restart failed trigger=${trigger}: ${normalizeReason(error)}`,
+      )
+      // next discoveryCycle will retry
+    }
   }
 
   scheduleReconnect({ delayMs = null, trigger = 'unknown' } = {}) {
@@ -1470,7 +1505,6 @@ class InstanceLockCoordinator {
     if (owner) {
       state.instanceOwner = owner
     }
-    console.log(`[instance_owner] instance=${instanceId} instance_owner=${state.instanceOwner}`)
     return true
   }
 
@@ -1684,8 +1718,10 @@ class InstanceManager {
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
-      const targetInstances = maxActiveInstances > 0 ? ordered.slice(0, maxActiveInstances) : []
+      const targetInstances = maxActiveInstances > 0 ? ordered.slice(0, maxActiveInstances) : ordered
       const targetIds = targetInstances.map((instance) => String(instance.id))
+
+      this.desiredIds = new Set(targetIds)
 
       for (const instance of targetInstances) {
         const candidate = String(instance.id)
@@ -1706,12 +1742,8 @@ class InstanceManager {
         }
       }
 
-      this.desiredIds = new Set(targetIds)
-
-      console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
-
       if (targetIds.length === 0) {
-        console.log('[discovery] eligible-instances body=', bodyText)
+        console.warn(`[discovery] no eligible instances — body=${bodyText?.slice(0, 200)}`)
       }
 
       for (const runtime of this.runtimes.values()) {
@@ -1729,9 +1761,11 @@ class InstanceManager {
         }
       }
 
-      console.log(
-        `[discovery] startedIds=${JSON.stringify(startedIds)} stoppedIds=${JSON.stringify(stoppedIds)}`,
-      )
+      if (startedIds.length > 0 || stoppedIds.length > 0) {
+        console.log(
+          `[discovery] changes started=${JSON.stringify(startedIds)} stopped=${JSON.stringify(stoppedIds)}`,
+        )
+      }
     } catch (error) {
       console.error(`[discovery] failed: ${normalizeReason(error)}`)
     } finally {
@@ -1804,7 +1838,11 @@ async function start() {
   }
 
   setInterval(() => {
-    console.log('[boot] worker alive')
+    const total = instanceManager?.runtimes?.size ?? 0
+    const connected = instanceManager
+      ? [...instanceManager.runtimes.values()].filter((r) => r.isConnected()).length
+      : 0
+    console.log(`[worker] alive instances=${total} connected=${connected} owner=${PROCESS_OWNER_ID}`)
   }, KEEP_ALIVE_MS)
 
   if (!EDGE_BASE_URL || !WORKER_SECRET) {
