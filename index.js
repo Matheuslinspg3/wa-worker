@@ -650,11 +650,12 @@ class OutboundQueueRunner {
       )
       const messages = Array.isArray(payload) ? payload : payload?.messages
       const count = Array.isArray(messages) ? messages.length : 0
-      console.log(`[queue] polled count=${count} instance=${this.runtime.instanceId}`)
 
       if (count === 0) {
         return
       }
+
+      console.log(`[queue] polled count=${count} instance=${this.runtime.instanceId}`)
 
       for (const queued of messages) {
         if (!this.runtime.isConnected() || !this.runtime.sock) {
@@ -678,7 +679,6 @@ class OutboundQueueRunner {
         }
 
         const { originalTo, toNormalized, error: toError } = await this.resolveDestination(queued)
-        console.log(`[send] toOriginal=${originalTo} toNormalized=${toNormalized}`)
 
         if (toError) {
           const reason = toError
@@ -706,7 +706,6 @@ class OutboundQueueRunner {
 
         try {
           const result = await this.sendWithSessionRecovery(toNormalized, queued)
-          console.log('[send-result]', JSON.stringify(result))
           await this.edgeClient.post('/mark-sent', {
             messageId: queued.id,
             wa_message_id: result?.key?.id || null,
@@ -976,8 +975,8 @@ class ConnectionRunner {
 
     this.sock.ev.on('messages.upsert', async (upsert) => {
       const instanceId = this.runtime.instanceId
-      console.log(`[upsert] instance=${instanceId} type=${upsert?.type} count=${upsert?.messages?.length || 0}`)
       if (!upsert?.messages?.length) return
+      console.log(`[upsert] instance=${instanceId} type=${upsert?.type} count=${upsert.messages.length}`)
 
       if (upsert.type && upsert.type !== 'notify' && upsert.type !== 'append') return
 
@@ -1012,16 +1011,6 @@ class ConnectionRunner {
 
         const chatIdCanonical = await this.resolveCanonicalJid(chatIdNorm)
         const senderJidCanonical = await this.resolveCanonicalJid(senderJidRaw, senderPn)
-
-        console.log('[identity]', {
-          chatId: chatIdNorm,
-          senderJid: senderJidRaw,
-          senderPn,
-          chatIdCanonical,
-          senderJidCanonical,
-          fromMe: !!key.fromMe,
-          sockUser: this.sock?.user?.id,
-        })
 
         const pushName = resolvePushName(upsert, msg)
         const senderContactId = key.fromMe
@@ -1123,8 +1112,9 @@ class ConnectionRunner {
         try {
           const dataUrl = await QRCode.toDataURL(update.qr)
           await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING', dataUrl)
+          console.log(`[qr] ready instance=${this.runtime.instanceId} — awaiting scan`)
         } catch (error) {
-          console.error(`[conn:${this.runtime.instanceId}] QR processing failed: ${normalizeReason(error)}`)
+          console.error(`[qr] failed instance=${this.runtime.instanceId}: ${normalizeReason(error)}`)
         }
       }
 
@@ -1135,7 +1125,7 @@ class ConnectionRunner {
         this.reconnectAttempt = 0
         this.badMacTimestamps = []
         this.clearReconnect()
-        console.log(`[conn:${this.runtime.instanceId}] open`)
+        console.log(`[conn:${this.runtime.instanceId}] open jid=${this.sock?.user?.id || 'unknown'}`)
         await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTED', null)
         this.outbound.start()
         return
@@ -1515,7 +1505,6 @@ class InstanceLockCoordinator {
     if (owner) {
       state.instanceOwner = owner
     }
-    console.log(`[instance_owner] instance=${instanceId} instance_owner=${state.instanceOwner}`)
     return true
   }
 
@@ -1753,10 +1742,8 @@ class InstanceManager {
         }
       }
 
-      console.log(`[discovery] targetIds=${JSON.stringify(targetIds)}`)
-
       if (targetIds.length === 0) {
-        console.log('[discovery] eligible-instances body=', bodyText)
+        console.warn(`[discovery] no eligible instances — body=${bodyText?.slice(0, 200)}`)
       }
 
       for (const runtime of this.runtimes.values()) {
@@ -1774,9 +1761,11 @@ class InstanceManager {
         }
       }
 
-      console.log(
-        `[discovery] startedIds=${JSON.stringify(startedIds)} stoppedIds=${JSON.stringify(stoppedIds)}`,
-      )
+      if (startedIds.length > 0 || stoppedIds.length > 0) {
+        console.log(
+          `[discovery] changes started=${JSON.stringify(startedIds)} stopped=${JSON.stringify(stoppedIds)}`,
+        )
+      }
     } catch (error) {
       console.error(`[discovery] failed: ${normalizeReason(error)}`)
     } finally {
@@ -1849,7 +1838,11 @@ async function start() {
   }
 
   setInterval(() => {
-    console.log('[boot] worker alive')
+    const total = instanceManager?.runtimes?.size ?? 0
+    const connected = instanceManager
+      ? [...instanceManager.runtimes.values()].filter((r) => r.isConnected()).length
+      : 0
+    console.log(`[worker] alive instances=${total} connected=${connected} owner=${PROCESS_OWNER_ID}`)
   }, KEEP_ALIVE_MS)
 
   if (!EDGE_BASE_URL || !WORKER_SECRET) {
