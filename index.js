@@ -1205,7 +1205,9 @@ class ConnectionRunner {
 
     this.badMacBreakerRunning = true
     this.badMacBreakerUntil = now + BAD_MAC_COOLDOWN_MS
-    this.tripBadMacCircuitBreaker(count).finally(() => {
+    this.tripBadMacCircuitBreaker(count).catch((error) => {
+      console.error(`[conn:${this.runtime.instanceId}] circuit-breaker failed: ${normalizeReason(error)}`)
+    }).finally(() => {
       this.badMacBreakerRunning = false
     })
   }
@@ -1244,8 +1246,15 @@ class ConnectionRunner {
       console.error(`[conn:${this.runtime.instanceId}] auth wipe failed: ${normalizeReason(error)}`)
     }
 
-    this.runtime.manager.resetRuntime(this.runtime.instanceId)
-    await this.runtime.manager.ensureRunning(this.runtime.instanceId)
+    try {
+      this.runtime.manager.resetRuntime(this.runtime.instanceId)
+      await this.runtime.manager.ensureRunning(this.runtime.instanceId)
+    } catch (error) {
+      console.error(
+        `[conn:${this.runtime.instanceId}] wipeAuthAndRestart restart failed trigger=${trigger}: ${normalizeReason(error)}`,
+      )
+      // next discoveryCycle will retry
+    }
   }
 
   scheduleReconnect({ delayMs = null, trigger = 'unknown' } = {}) {
