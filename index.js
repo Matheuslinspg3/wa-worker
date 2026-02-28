@@ -1720,7 +1720,7 @@ class InstanceManager {
 
       const maxActiveInstances = this.getMaxActiveInstances(settings)
       const ordered = this.stablePrioritize(instancesRaw)
-      const targetInstances = maxActiveInstances > 0 ? ordered.slice(0, maxActiveInstances) : []
+      const targetInstances = maxActiveInstances > 0 ? ordered.slice(0, maxActiveInstances) : ordered
       const targetIds = targetInstances.map((instance) => String(instance.id))
 
       this.desiredIds = new Set(targetIds)
