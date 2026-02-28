@@ -880,8 +880,13 @@ class ConnectionRunner {
     this.intentionalStop = false
     this.connecting = true
 
+    // Reset to DISCONNECTED before starting a new attempt so the edge server always sees
+    // a real status transition (DISCONNECTED → CONNECTING) when the QR code is delivered.
+    // Without this, if the previous state was already CONNECTING (e.g. after a crash), the
+    // edge server may ignore the QR delivery because the status did not change.
+    await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'DISCONNECTED', null)
+
     try {
-      await this.edgeClient.safeUpdateStatus(this.runtime.instanceId, 'CONNECTING')
       const { state, saveCreds } = await useMultiFileAuthState(this.authPath)
       const { version } = await fetchLatestBaileysVersion()
       this.sock = makeWASocket({ auth: state, version })
